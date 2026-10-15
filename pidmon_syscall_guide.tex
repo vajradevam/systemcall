@@ -1,0 +1,524 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+
+\definecolor{cmt}{rgb}{0.25,0.45,0.25}
+\definecolor{kw}{rgb}{0.15,0.2,0.65}
+\lstdefinestyle{kc}{
+  language=C, basicstyle=\ttfamily\footnotesize, keywordstyle=\color{kw},
+  commentstyle=\color{cmt}\itshape, showstringspaces=false, columns=fullflexible,
+  breaklines=true, frame=single, rulecolor=\color{black!25}, tabsize=8,
+  morekeywords={u8,u32,u64,__u32,__u64,aligned_u64,pid_t,bool,size_t,SYSCALL_DEFINE4}
+}
+\lstdefinestyle{sh}{basicstyle=\ttfamily\footnotesize, frame=single, rulecolor=\color{black!25},
+  breaklines=true, columns=fullflexible, showstringspaces=false}
+\lstset{style=kc}
+
+\newtcolorbox{decision}[1][]{colback=yellow!8,colframe=orange!70!black,title=Design decision,fonttitle=\bfseries\small,#1}
+\newtcolorbox{warn}[1][]{colback=red!4,colframe=red!60!black,title=Pitfall,fonttitle=\bfseries\small,#1}
+
+\newcommand{\kfile}[1]{\texttt{\small #1}}
+
+\title{Adding a Process-Subtree Monitoring and Enforcement System Call\\to the Linux Kernel\\[2pt]\large A Step-by-Step Implementation Guide}
+\author{CS G623 -- System Calls Assignment}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip
+
+\begin{tcolorbox}[colback=blue!4,colframe=blue!50!black,title=Read this first,fonttitle=\bfseries\small]
+This guide was written without a kernel tree at hand. The \emph{ideas}, file locations and the
+overall structure are stable, but exact helper names, header locations and syscall numbers drift
+between releases. Every code block is therefore a \emph{skeleton to be compiled and corrected against
+your tree}. Where a detail is worth double-checking I say so, and Section~\ref{sec:verify} lists
+greps to run.
+\end{tcolorbox}
+
+%--------------------------------------------------------------------
+\section{The problem statement, restated precisely}
+%--------------------------------------------------------------------
+The assignment asks for one new system call that, given a \texttt{pid}:
+
+\begin{enumerate}[label=\textbf{R\arabic*.}]
+  \item reports the \textbf{resource utilisation} of that process (CPU time, memory, \dots);
+  \item \textbf{enforces limits} on it, i.e.\ takes an appropriate action if the process is over its limits;
+  \item does so \textbf{only if} the target is the caller itself, or lies in the caller's
+        \textbf{descendant tree} (children, grandchildren, great-grandchildren, \dots);
+  \item otherwise refuses.
+\end{enumerate}
+
+Three things in this statement are under-specified and you must pin them down before writing code:
+\emph{which} resources, \emph{which} limits (and where they come from), and \emph{what} ``appropriate action'' is.
+Section~\ref{sec:design} proposes defaults; confirm them with your instructor.
+
+%--------------------------------------------------------------------
+\section{Background you need}
+%--------------------------------------------------------------------
+\subsection{How a system call reaches your code (x86-64)}
+\begin{enumerate}
+  \item User space puts the syscall number in \texttt{rax}, arguments in \texttt{rdi, rsi, rdx, r10, r8, r9}, and executes \texttt{syscall}.
+  \item The CPU jumps to \texttt{entry\_SYSCALL\_64} (\kfile{arch/x86/entry/entry\_64.S}), which saves registers and calls \texttt{do\_syscall\_64()} (\kfile{arch/x86/entry/syscall\_64.c}).
+  \item That indexes \texttt{sys\_call\_table[nr]} and calls the handler. The table is \emph{generated at build time} from \kfile{arch/x86/entry/syscalls/syscall\_64.tbl}.
+  \item The handler is whatever you declared with \texttt{SYSCALL\_DEFINEn(name, \dots)}. The macro creates \texttt{\_\_x64\_sys\_name}, wraps argument fetching/sign-extension, and registers the function for error injection and tracing.
+\end{enumerate}
+So adding a syscall means: (a) write the function, (b) give it a number in the table, (c) declare its prototype, (d) wire it into the build, (e) expose a user-space ABI struct, (f) test.
+
+\subsection{Process relationships in the kernel}
+\begin{itemize}
+  \item Kernel unit of scheduling is \texttt{struct task\_struct}; a \emph{process} is a thread group. \texttt{task->group\_leader} is the main thread; its PID is the TGID that user space calls ``pid''.
+  \item \texttt{task->real\_parent} is the task that \texttt{fork()}ed it (or its reaper, after reparenting). \texttt{task->parent} may differ while \texttt{ptrace}d. \textbf{Use \texttt{real\_parent}}, since the question is about genealogy, not debugging.
+  \item When a parent dies, children are \emph{reparented} to a sub-reaper or to the namespace init. From that moment they are no longer in the former parent's tree. This is the correct behaviour for your syscall, but it must be documented and tested.
+  \item PIDs are namespaced. User space passes a number valid in \emph{its own} PID namespace: use \texttt{find\_task\_by\_vpid()}, not \texttt{find\_task\_by\_pid\_ns(\dots, \&init\_pid\_ns)}.
+\end{itemize}
+
+\subsection{Resource accounting already in the kernel}
+You are not meant to invent accounting; read what is there.
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Quantity & Where it lives & Helper \\
+\midrule
+User/system CPU time (whole process) & per-thread \& \texttt{signal\_struct} & \texttt{thread\_group\_cputime\_adjusted()} \\
+Resident set size & \texttt{mm\_struct} counters & \texttt{get\_mm\_rss(mm)} \\
+Virtual size & \texttt{mm->total\_vm} (pages) & direct read \\
+Thread count & \texttt{signal->nr\_threads} & \texttt{get\_nr\_threads(t)} \\
+Page faults, ctx switches, I/O & per-task / \texttt{signal\_struct} & see \texttt{k\_getrusage()} in \kfile{kernel/sys.c} \\
+Limits (soft, hard) & \texttt{signal->rlim[]} & \texttt{task\_rlimit()}, \texttt{task\_rlimit\_max()} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\kfile{kernel/sys.c: k\_getrusage()} is the best worked example of aggregating usage over a thread group; read it before you start.
+
+%--------------------------------------------------------------------
+\section{Design}\label{sec:design}
+%--------------------------------------------------------------------
+\subsection{Interface}
+Modern syscall conventions (see \kfile{Documentation/process/adding-syscalls.rst}) ask for a \texttt{flags} argument and an extensible, size-versioned struct passed by pointer, as with \texttt{clone3} and \texttt{openat2}.
+
+\begin{lstlisting}
+long pidmon(pid_t pid, unsigned int flags,
+            struct pidmon_usage __user *uattr, size_t usize);
+\end{lstlisting}
+
+\begin{itemize}
+  \item \texttt{pid}: target TGID in the caller's PID namespace. \texttt{0} means ``myself''.
+  \item \texttt{flags}: must be \texttt{0} or a defined bit. Reject unknown bits with \texttt{-EINVAL} (otherwise you can never define them later). Suggested: \texttt{PIDMON\_F\_NO\_ENFORCE} (report only, a dry run, very useful for testing).
+  \item \texttt{uattr}/\texttt{usize}: output buffer and its size, copied with \texttt{copy\_struct\_to\_user()}, which handles older/newer user structs.
+  \item Returns \texttt{0} on success; the action taken is reported \emph{in the struct}.
+\end{itemize}
+
+\begin{tabular}{@{}ll@{}}
+\toprule
+Error & Meaning \\
+\midrule
+\texttt{ESRCH} & no such process in the caller's namespace \\
+\texttt{EPERM} & target exists but is not the caller or a descendant \\
+\texttt{EINVAL} & bad flags or \texttt{usize} too small \\
+\texttt{EFAULT} & bad user pointer \\
+\bottomrule
+\end{tabular}
+
+\begin{decision}
+\textbf{Return \texttt{ESRCH} vs.\ \texttt{EPERM}?} Returning \texttt{EPERM} for ``exists but not yours'' leaks existence of arbitrary PIDs; but \texttt{kill(2)} does the same and PIDs are already visible in \texttt{/proc}. Keep \texttt{EPERM}; it is more helpful for the grader and for debugging.
+\end{decision}
+
+\subsection{Where do the ``limits'' come from?}
+The problem passes only a \texttt{pid}, so the limits cannot be call arguments. The natural source is the target's existing \textbf{\texttt{RLIMIT\_*}} values, set via \texttt{setrlimit(2)}/\texttt{prlimit(2)}. This needs no new storage and fits Linux semantics. Suggested resources:
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Limit & Measured against & Note \\
+\midrule
+\texttt{RLIMIT\_CPU} & utime+stime, seconds & kernel already enforces this via timers; yours adds on-demand enforcement \\
+\texttt{RLIMIT\_AS} & \texttt{total\_vm}$\times$page size & kernel enforces at \texttt{mmap}; check anyway \\
+\texttt{RLIMIT\_RSS} & \texttt{get\_mm\_rss()}$\times$page size & \textbf{not enforced by Linux at all}, so your call is the only enforcer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{decision}
+\textbf{Alternative:} a new per-task limits table (e.g.\ in \texttt{signal\_struct}) set by a second syscall or \texttt{prctl}. More work, more freedom, and more risk. Use \texttt{RLIMIT\_*} unless the assignment demands otherwise.
+\end{decision}
+
+\subsection{What is the ``appropriate action''?}
+Proposed policy, per resource, strongest wins:
+
+\begin{center}\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Condition & Action \\
+\midrule
+usage $<$ soft limit (or limit is \texttt{RLIM\_INFINITY}) & none \\
+soft $\le$ usage $<$ hard & send \texttt{SIGXCPU} for CPU, \texttt{SIGTERM} otherwise (catchable warning) \\
+usage $\ge$ hard & send \texttt{SIGKILL} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Report the verdict in the struct (\texttt{action} field) so the caller knows what happened.
+
+%--------------------------------------------------------------------
+\section{Environment setup}
+%--------------------------------------------------------------------
+\subsection{Get the source}
+\begin{lstlisting}[style=sh]
+git clone https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+cd linux
+git checkout -b pidmon-syscall           # work on a branch, commit often
+\end{lstlisting}
+Tracking Linus's tree is ``latest mainline''. Note the tag you started from (\texttt{git describe}) in your report.
+
+\subsection{Build tools (Arch Linux)}
+\begin{lstlisting}[style=sh]
+sudo pacman -S --needed base-devel bc cpio pahole libelf perl python \
+     flex bison openssl qemu-system-x86 busybox
+\end{lstlisting}
+
+\subsection{Never test on your host}
+A buggy syscall can oops or hang the machine. Use a VM. Two good options:
+\begin{itemize}
+  \item \textbf{virtme-ng} (fastest loop): \texttt{vng -v --build} builds the tree and boots it in QEMU sharing your filesystem; \texttt{vng -- ./test} runs a program inside.
+  \item \textbf{QEMU + initramfs}: build with a minimal config, pack your static test binary and busybox into an initramfs, boot with \texttt{-kernel arch/x86/boot/bzImage -initrd \dots{} -append "console=ttyS0" -nographic}.
+\end{itemize}
+Your test programs must be built \texttt{-static} when using a bare initramfs.
+
+\subsection{Config}
+\begin{lstlisting}[style=sh]
+make defconfig                 # or: vng --kconfig
+scripts/config -e DEBUG_KERNEL -e DEBUG_INFO_DWARF5 -e PROVE_LOCKING \
+               -e KASAN -e DEBUG_ATOMIC_SLEEP -e DEBUG_LIST
+make olddefconfig && make -j"$(nproc)"
+\end{lstlisting}
+\texttt{PROVE\_LOCKING} (lockdep), \texttt{DEBUG\_ATOMIC\_SLEEP} (``sleeping in RCU section'' bugs) and \texttt{KASAN} catch precisely the mistakes this syscall invites. They slow the kernel; that is fine in a VM.
+
+%--------------------------------------------------------------------
+\section{Implementation steps}
+%--------------------------------------------------------------------
+\subsection{Step 1: the user-space ABI header}
+Create \kfile{include/uapi/linux/pidmon.h}. Rules for UAPI structs: fixed-width types only; explicit 64-bit alignment (\texttt{aligned\_u64}) so 32-bit and 64-bit layouts agree; no pointers-sized types; add new fields only at the end; no padding holes.
+
+\begin{lstlisting}
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
+#ifndef _UAPI_LINUX_PIDMON_H
+#define _UAPI_LINUX_PIDMON_H
+#include <linux/types.h>
+
+#define PIDMON_F_NO_ENFORCE	(1U << 0)	/* report only, take no action */
+#define PIDMON_F_VALID		(PIDMON_F_NO_ENFORCE)
+
+#define PIDMON_ACT_NONE		0
+#define PIDMON_ACT_WARNED	1	/* soft limit exceeded */
+#define PIDMON_ACT_KILLED	2	/* hard limit exceeded */
+
+struct pidmon_usage {
+	__u64 utime_ns;		/* user CPU time, whole thread group */
+	__u64 stime_ns;		/* system CPU time */
+	__u64 rss_bytes;
+	__u64 vm_bytes;
+	__u32 nr_threads;
+	__u32 action;		/* PIDMON_ACT_* taken (or that would be taken) */
+	__u32 exceeded;		/* bitmask of RLIMIT_* numbers that tripped */
+	__u32 __pad;
+	/* new fields go below this line */
+};
+#define PIDMON_USAGE_SIZE_VER0	48	/* sizeof() at first release */
+#endif
+\end{lstlisting}
+The header is exported to user space by \texttt{make headers\_install}; \kfile{include/uapi/linux/Kbuild} usually needs no edit since headers are picked up by wildcard, but verify.
+
+\subsection{Step 2: the implementation file}
+Create \kfile{kernel/pidmon.c} and add \texttt{obj-y += pidmon.o} to \kfile{kernel/Makefile}. (You may instead put the code in \kfile{kernel/sys.c}; a separate file is cleaner for review.)
+
+\subsubsection*{2a. Tree-membership check}
+Walk \emph{upwards} from the target. This is cheap ($O(\text{depth})$), needs no global lock, and is exactly the definition of ``descendant''.
+
+\begin{lstlisting}
+/* Caller must hold rcu_read_lock(). */
+static bool pidmon_in_my_tree(struct task_struct *t)
+{
+	struct task_struct *p;
+
+	for (p = t; p != &init_task; p = rcu_dereference(p->real_parent))
+		if (same_thread_group(p, current))
+			return true;	/* t == me, or I am an ancestor */
+	return false;
+}
+\end{lstlisting}
+
+\textbf{Why this is correct.}
+The first iteration (\texttt{p == t}) handles ``self'' (any thread of my process counts). Every later iteration moves one generation up, so reaching a task in my thread group means I am some ancestor. The loop stops at \texttt{init\_task} (the idle task, whose \texttt{real\_parent} is itself), so it always terminates. Using \texttt{same\_thread\_group} rather than \texttt{p == current} matters because \texttt{real\_parent} points to the \emph{thread} that called \texttt{fork}, which need not be the caller's thread.
+
+\begin{warn}
+\texttt{real\_parent} is RCU-protected; dereference it only inside \texttt{rcu\_read\_lock()} with \texttt{rcu\_dereference}. Do \emph{not} use \texttt{task->parent} (ptrace-modified) and do \emph{not} compare PIDs as integers (namespaces, reuse).
+\end{warn}
+
+\subsubsection*{2b. Gathering usage}
+\begin{lstlisting}
+static void pidmon_collect(struct task_struct *t, struct pidmon_usage *u)
+{
+	struct mm_struct *mm;
+	u64 ut, st;
+
+	thread_group_cputime_adjusted(t, &ut, &st);	/* may take locks; fine */
+	u->utime_ns   = ut;
+	u->stime_ns   = st;
+	u->nr_threads = get_nr_threads(t);
+
+	mm = get_task_mm(t);			/* NULL for zombies/kthreads */
+	if (mm) {
+		u->rss_bytes = (u64)get_mm_rss(mm) << PAGE_SHIFT;
+		u->vm_bytes  = (u64)mm->total_vm   << PAGE_SHIFT;
+		mmput(mm);			/* may sleep: not under RCU */
+	}
+}
+\end{lstlisting}
+Zombie targets have no \texttt{mm}; reporting zero memory is correct. Add more fields (page faults, context switches) by following \texttt{k\_getrusage()}.
+
+\subsubsection*{2c. Deciding the action}
+\begin{lstlisting}
+static u32 pidmon_judge(struct task_struct *t, const struct pidmon_usage *u,
+			u32 *exceeded, int *sig)
+{
+	struct { int res; u64 val; int soft_sig; } chk[] = {
+		{ RLIMIT_CPU, (u->utime_ns + u->stime_ns) / NSEC_PER_SEC, SIGXCPU },
+		{ RLIMIT_AS,  u->vm_bytes,  SIGTERM },
+		{ RLIMIT_RSS, u->rss_bytes, SIGTERM },
+	};
+	u32 act = PIDMON_ACT_NONE;
+	int i;
+
+	*exceeded = 0; *sig = 0;
+	for (i = 0; i < ARRAY_SIZE(chk); i++) {
+		unsigned long soft = task_rlimit(t, chk[i].res);
+		unsigned long hard = task_rlimit_max(t, chk[i].res);
+
+		if (hard != RLIM_INFINITY && chk[i].val >= hard) {
+			*exceeded |= BIT(chk[i].res);
+			act = PIDMON_ACT_KILLED;
+			*sig = SIGKILL;
+		} else if (soft != RLIM_INFINITY && chk[i].val >= soft) {
+			*exceeded |= BIT(chk[i].res);
+			if (act < PIDMON_ACT_WARNED) {
+				act = PIDMON_ACT_WARNED;
+				*sig = chk[i].soft_sig;
+			}
+		}
+	}
+	return act;
+}
+\end{lstlisting}
+\textbf{Why \texttt{task\_rlimit(t,\dots)} and not \texttt{rlimit(\dots)}:} the latter reads \emph{current's} limits; you want the \emph{target's}. Mind the units: \texttt{RLIMIT\_CPU} is in seconds, memory limits in bytes. Compare in the same unit.
+
+\subsubsection*{2d. The syscall itself}
+\begin{lstlisting}
+SYSCALL_DEFINE4(pidmon, pid_t, pid, unsigned int, flags,
+		struct pidmon_usage __user *, uattr, size_t, usize)
+{
+	struct pidmon_usage u = {};
+	struct task_struct *t;
+	struct pid *spid;
+	int sig, ret;
+
+	if (flags & ~PIDMON_F_VALID)
+		return -EINVAL;
+	if (usize < PIDMON_USAGE_SIZE_VER0)
+		return -EINVAL;
+	if (pid < 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	t = pid ? find_task_by_vpid(pid) : current;
+	if (!t) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+	t = t->group_leader;			/* operate on the process */
+	if (!pidmon_in_my_tree(t)) {
+		rcu_read_unlock();
+		return -EPERM;
+	}
+	get_task_struct(t);			/* pin it past the RCU section */
+	spid = get_pid(task_tgid(t));		/* pin the pid: no reuse races */
+	rcu_read_unlock();
+
+	pidmon_collect(t, &u);
+	u.action = pidmon_judge(t, &u, &u.exceeded, &sig);
+
+	ret = copy_struct_to_user(uattr, usize, &u, sizeof(u), NULL);
+	if (!ret && sig && !(flags & PIDMON_F_NO_ENFORCE))
+		kill_pid(spid, sig, 1);		/* 1 = SEND_SIG_PRIV */
+
+	put_pid(spid);
+	put_task_struct(t);
+	return ret;
+}
+\end{lstlisting}
+
+\textbf{Walk-through of the choices.}
+\begin{itemize}
+  \item \emph{Validate before touching anything}: flags, size, sign of pid.
+  \item \emph{RCU section covers lookup + tree check only}: you may not sleep inside it. \texttt{get\_task\_mm}/\texttt{mmput}, \texttt{copy\_to\_user} and \texttt{kill\_pid} are all done outside, on pinned objects.
+  \item \emph{\texttt{get\_pid} before \texttt{kill}}: between your check and the signal the target could exit and its numeric PID be recycled. Signalling a \texttt{struct pid *} you hold a reference on can only reach the process you vetted (or nothing).
+  \item \emph{Copy out before enforcing}: if the user pointer is bad you fail with \texttt{EFAULT} without having killed anything.
+  \item \emph{Authorisation}: being an ancestor \emph{is} the permission, so \texttt{kill\_pid(\dots, priv=1)} deliberately skips the usual uid/capability check (a child may have changed uid; a parent still has authority here). State this explicitly in your report. If you prefer conservative semantics, pass \texttt{priv=0} and \texttt{kill(2)} rules apply.
+  \item \emph{Self-enforcement}: if \texttt{pid} is yourself and you are over a hard limit, you will be killed. That is the specified behaviour.
+\end{itemize}
+
+\begin{warn}
+Do not take \texttt{tasklist\_lock} unless you walk \emph{down} the child lists. The upward walk under RCU avoids it. Do not call anything that may sleep between \texttt{rcu\_read\_lock()} and \texttt{rcu\_read\_unlock()}; \texttt{DEBUG\_ATOMIC\_SLEEP} will flag it.
+\end{warn}
+
+\subsubsection*{2e. Includes}
+At the top of \kfile{kernel/pidmon.c}:
+\begin{lstlisting}
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/syscalls.h>
+#include <linux/sched.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/cputime.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
+#include <linux/mm.h>
+#include <linux/pid.h>
+#include <linux/uaccess.h>
+#include <linux/resource.h>
+#include <uapi/linux/pidmon.h>
+\end{lstlisting}
+
+\subsection{Step 3: register the syscall}
+\begin{enumerate}
+  \item \textbf{Prototype} in \kfile{include/linux/syscalls.h}:
+\begin{lstlisting}
+struct pidmon_usage;
+asmlinkage long sys_pidmon(pid_t pid, unsigned int flags,
+			   struct pidmon_usage __user *uattr, size_t usize);
+\end{lstlisting}
+  \item \textbf{x86-64 table}, \kfile{arch/x86/entry/syscalls/syscall\_64.tbl}: add a line in the \texttt{common} range using the next unused number (open the file, scroll to the end of the \texttt{common} block before the \texttt{x32} section starting at 512, and take the successor of the highest number):
+\begin{lstlisting}[style=sh]
+<NR>	common	pidmon		sys_pidmon
+\end{lstlisting}
+  \item \textbf{x86-32 table} (optional but good practice), \kfile{arch/x86/entry/syscalls/syscall\_32.tbl}: same number, \texttt{i386} ABI, entry \texttt{sys\_pidmon}. Because your struct uses only fixed-width types, no compat wrapper is needed.
+  \item \textbf{Other architectures} (arm64, riscv, \dots) use the generic list: \kfile{include/uapi/asm-generic/unistd.h} (and, in recent trees, \kfile{scripts/syscall.tbl}). The assignment targets x86, so say in your report that you only wired x86, or do the generic one too; \texttt{scripts/checksyscalls.sh} will warn about tables left inconsistent.
+\end{enumerate}
+\textbf{Why numbers are append-only:} syscall numbers are ABI. Never reuse or renumber.
+
+\subsection{Step 4: build}
+\begin{lstlisting}[style=sh]
+make -j"$(nproc)" 2>&1 | tee build.log
+\end{lstlisting}
+Typical first-build errors: missing include for \texttt{thread\_group\_cputime\_adjusted} (\texttt{linux/sched/cputime.h}), an undeclared \texttt{RLIM\_INFINITY} (\texttt{linux/resource.h}), and a mismatch between the table's entry name and the \texttt{SYSCALL\_DEFINE} name.
+
+%--------------------------------------------------------------------
+\section{Testing}
+%--------------------------------------------------------------------
+\subsection{User-space wrapper}
+Until glibc knows your syscall, use \texttt{syscall(2)}:
+\begin{lstlisting}
+#define _GNU_SOURCE
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/pidmon.h>		/* from make headers_install */
+#define __NR_pidmon <NR>
+
+static long pidmon(pid_t pid, unsigned flags, struct pidmon_usage *u)
+{
+	return syscall(__NR_pidmon, pid, flags, u, sizeof(*u));
+}
+\end{lstlisting}
+
+\subsection{Test matrix}
+Write one C program with these cases; each should print PASS/FAIL.
+
+\begin{center}\small
+\begin{tabular}{@{}p{5.6cm}p{5.2cm}p{3.5cm}@{}}
+\toprule
+Scenario & Expected & Verifies \\
+\midrule
+\texttt{pid = getpid()} and \texttt{pid = 0} & 0, sane numbers & R3 self \\
+direct child & 0 & child \\
+grandchild, great-grandchild (fork chains) & 0 & deep tree \\
+parent (\texttt{getppid()}) & \texttt{EPERM} & upward is forbidden \\
+sibling & \texttt{EPERM} & not a descendant \\
+\texttt{pid = 1}, random live pid & \texttt{EPERM} & unrelated \\
+nonexistent pid & \texttt{ESRCH} & lookup failure \\
+negative pid, bad flags, small \texttt{usize} & \texttt{EINVAL} & validation \\
+\texttt{uattr = NULL} / bad pointer & \texttt{EFAULT} & no kill happened \\
+child busy-loops, \texttt{RLIMIT\_CPU} hard=1s & after $\sim$1 s call: \texttt{KILLED}, child dies by \texttt{SIGKILL} & enforcement CPU \\
+child \texttt{malloc}+touch, \texttt{RLIMIT\_RSS} soft below usage & \texttt{WARNED}, child gets \texttt{SIGTERM} & enforcement soft \\
+same with \texttt{PIDMON\_F\_NO\_ENFORCE} & action reported, child still alive & dry run \\
+orphan: middle process exits, grandchild reparented & \texttt{EPERM} for former grandparent & reparenting \\
+multithreaded child & \texttt{nr\_threads}, CPU summed over threads & thread group \\
+zombie child (not yet \texttt{wait}ed) & 0, zero memory & \texttt{mm == NULL} path \\
+inside \texttt{unshare -p} namespace & vpid numbering works & namespaces \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Set limits in the \emph{child} with \texttt{setrlimit} (or the parent with \texttt{prlimit(child, \dots)}) before the call. Note that you cannot raise a hard limit back without privilege; design tests accordingly.
+
+\subsection{Stress / debug}
+\begin{itemize}
+  \item Run the fork-chain test in a loop of thousands of iterations with random exits to shake out reference-count and RCU bugs.
+  \item Run under the debug config of Section~3.3 and check \texttt{dmesg} for lockdep, KASAN or ``sleeping function called from invalid context'' reports. A clean \texttt{dmesg} is part of your evidence.
+  \item Use \texttt{strace} inside the VM to confirm arguments; use \texttt{printk}/\texttt{trace\_printk} sparingly and remove it afterwards.
+\end{itemize}
+
+%--------------------------------------------------------------------
+\section{Polish expected of a mainline-quality change}
+%--------------------------------------------------------------------
+\begin{itemize}
+  \item \texttt{scripts/checkpatch.pl --strict} on your patch; fix style (tabs, 80--100 columns, SPDX line).
+  \item A selftest under \kfile{tools/testing/selftests/pidmon/} (Makefile + test using the \texttt{kselftest\_harness.h} \texttt{TEST()} macros). Your matrix above is the content.
+  \item Documentation: \kfile{Documentation/userspace-api/pidmon.rst} describing semantics, errors and the tree rule.
+  \item Mirror the syscall number into the tools copies if your tree has them (\kfile{tools/include/uapi/asm-generic/unistd.h}, \kfile{tools/perf/arch/x86/entry/syscalls/syscall\_64.tbl}); \texttt{tools/perf/check-headers.sh} complains otherwise.
+  \item Commit with a proper message: imperative subject, \texttt{Signed-off-by:} line (\texttt{git commit -s}), a body explaining \emph{why}. Produce the patch with \texttt{git format-patch -1}. Do \emph{not} actually mail it to LKML for a course assignment.
+\end{itemize}
+
+%--------------------------------------------------------------------
+\section{Verification greps (names that drift between releases)}\label{sec:verify}
+%--------------------------------------------------------------------
+Run these in the tree before trusting any signature in this document.
+\begin{lstlisting}[style=sh]
+grep -rn "thread_group_cputime_adjusted" include/linux/sched/cputime.h
+grep -n  "task_rlimit\|task_rlimit_max"  include/linux/sched/signal.h
+grep -n  "copy_struct_to_user"           include/linux/uaccess.h
+grep -n  "int kill_pid("                 kernel/signal.c include/linux/signal.h
+grep -n  "get_mm_rss\|get_task_mm"       include/linux/mm.h include/linux/sched/mm.h
+grep -n  "same_thread_group\|get_nr_threads" include/linux/sched/signal.h
+tail -n 30 arch/x86/entry/syscalls/syscall_64.tbl    # next free number
+sed -n '/k_getrusage/,/^}/p' kernel/sys.c            # how real accounting is aggregated
+\end{lstlisting}
+Also read, in order: \kfile{Documentation/process/adding-syscalls.rst}, \kfile{kernel/sys.c} (\texttt{getrusage}, \texttt{prlimit}), \kfile{kernel/signal.c} (\texttt{kill\_pid\_info}), and one recent small syscall addition via \texttt{git log --oneline -- arch/x86/entry/syscalls/syscall\_64.tbl}; open the top commit with \texttt{git show} to see exactly which files such a change touches.
+
+%--------------------------------------------------------------------
+\section{Suggested work plan}
+%--------------------------------------------------------------------
+\begin{enumerate}
+  \item Clone, build the \emph{unmodified} kernel, boot it in a VM, run a trivial program. (Confirms the toolchain.)
+  \item Add a stub syscall that just returns 42; wire the table, call it from user space. (Confirms plumbing.)
+  \item Implement tree check + the \texttt{EPERM}/\texttt{ESRCH} logic; test the relationship rows.
+  \item Add \texttt{pidmon\_collect}; compare against \texttt{/proc/<pid>/stat} and \texttt{status}.
+  \item Add \texttt{pidmon\_judge} with \texttt{NO\_ENFORCE}; then enable signals.
+  \item Debug-config soak test, selftest, documentation, report.
+\end{enumerate}
+
+\section*{Open questions for your instructor}
+\begin{enumerate}
+  \item Which resources must be reported (is CPU + RSS + VM enough)?
+  \item Are limits meant to be the target's \texttt{RLIMIT\_*}, or a new mechanism?
+  \item Is ``appropriate action'' terminate-on-hard-limit with warning-on-soft, or something else (e.g.\ throttle, \texttt{SIGSTOP})?
+  \item Should the syscall be restricted to x86-64, and what is the exact required name/signature?
+\end{enumerate}
+
+\end{document}

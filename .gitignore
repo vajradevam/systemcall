@@ -1,0 +1,5 @@
+linux/
+build-*/
+hdr/
+rootfs/
+out/
