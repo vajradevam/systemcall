@@ -1,4 +1,4 @@
-build-*/
-hdr/
-rootfs/
-out/
+/build-*/
+/hdr/
+/rootfs/
+/out/
