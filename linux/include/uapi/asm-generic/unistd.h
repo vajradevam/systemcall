@@ -868,11 +868,13 @@ __SYSCALL(__NR_rseq_slice_yield, sys_rseq_slice_yield)
 __SYSCALL(__NR_fchroot, sys_fchroot)
 
 /* kernel/pidmon.c */
-#define __NR_pidmon 473
-__SYSCALL(__NR_pidmon, sys_pidmon)
+#define __NR_pidmon_start 473
+__SYSCALL(__NR_pidmon_start, sys_pidmon_start)
+#define __NR_pidmon_read 474
+__SYSCALL(__NR_pidmon_read, sys_pidmon_read)
 
 #undef __NR_syscalls
-#define __NR_syscalls 474
+#define __NR_syscalls 475
 
 /*
  * 32 bit systems traditionally used different

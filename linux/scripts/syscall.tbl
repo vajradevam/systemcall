@@ -413,4 +413,5 @@
 470	common	listns				sys_listns
 471	common	rseq_slice_yield		sys_rseq_slice_yield
 472	common	fchroot				sys_fchroot
-473	common	pidmon				sys_pidmon
+473	common	pidmon_start			sys_pidmon_start
+474	common	pidmon_read			sys_pidmon_read

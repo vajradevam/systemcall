@@ -478,4 +478,5 @@
 470	i386	listns			sys_listns
 471	i386	rseq_slice_yield	sys_rseq_slice_yield
 472	i386	fchroot			sys_fchroot
-473	i386	pidmon			sys_pidmon
+473	i386	pidmon_start		sys_pidmon_start
+474	i386	pidmon_read		sys_pidmon_read
