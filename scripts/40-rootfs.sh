@@ -15,7 +15,7 @@ cp "$BB" "$ROOTFS/bin/busybox"
 for src in "$HARNESS"/tests/*.c; do
   [ -e "$src" ] || continue
   # -isystem: our freshly installed UAPI headers must win over the host's /usr/include/linux
-  gcc -static -O1 -g -Wall -Wextra -isystem "$HDR/include" -o "$ROOTFS/tests/$(basename "${src%.c}")" "$src"
+  gcc -static -pthread -O1 -g -Wall -Wextra -isystem "$HDR/include" -o "$ROOTFS/tests/$(basename "${src%.c}")" "$src"
 done
 
 cat > "$ROOTFS/init" <<'EOF'
@@ -30,8 +30,9 @@ for t in /tests/*; do
   echo "=== $t"
   "$t" || { echo "=== $t FAILED (rc=$?)"; fail=1; }
 done
-# any splat from lockdep / KASAN / atomic-sleep checks counts as failure
-if dmesg | grep -E 'BUG:|WARNING:|Oops|KASAN|lockdep|possible (circular|recursive)'; then
+# any splat from lockdep / KASAN / atomic-sleep checks counts as failure (match splat markers, not
+# the boot banner "RCU lockdep checking is enabled")
+if dmesg | grep -E 'BUG:|WARNING:|Oops|KASAN:|possible (circular|recursive)'; then
   echo "=== kernel complained (see above)"; fail=1
 fi
 echo "PIDMON_EXIT=$fail"
