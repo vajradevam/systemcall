@@ -197,6 +197,9 @@ struct signal_struct {
 	unsigned long maxrss, cmaxrss;
 	struct task_io_accounting ioac;
 
+	/* pidmon monitor records owned by this thread group (kernel/pidmon.c) */
+	struct hlist_head pidmon_recs;
+
 	/*
 	 * Cumulative ns of schedule CPU time fo dead threads in the
 	 * group, not including a zombie group leader, (This only differs
