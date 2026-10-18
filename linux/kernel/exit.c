@@ -70,6 +70,7 @@
 #include <linux/unwind_deferred.h>
 #include <linux/uaccess.h>
 #include <linux/pidfs.h>
+#include <linux/pidmon.h>
 
 #include <uapi/linux/wait.h>
 
@@ -946,6 +947,7 @@ void __noreturn do_exit(long code)
 #endif
 		if (tsk->mm)
 			setmax_mm_hiwater_rss(&tsk->signal->maxrss, tsk->mm);
+		pidmon_exit(tsk);	/* before exit_mm() drops the mm */
 	}
 	acct_collect(code, group_dead);
 	if (group_dead)
