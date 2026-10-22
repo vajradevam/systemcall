@@ -1,274 +1,166 @@
-# pidmon: a process-monitoring system call for Linux (CS-G623)
+# monitor and limit your own child processes (CS-G623)
 
-A new system call in mainline Linux. Given a pid, it **reports that process's resource
-utilization and enforces limits by taking an appropriate action**, but only if the pid is the
-caller itself or one of its descendants (children, grandchildren, ...). For any other process it
-refuses.
+`pidmon` adds two system calls to Linux. A process can ask the kernel how much CPU, memory and
+I/O one of its **descendants** (child, grandchild, ...) has used, and the kernel enforces that
+descendant's resource limits when asked. Any pid outside the caller's own subtree is refused.
 
-This repo holds the kernel source with our syscall, plus the scripts and tests we use to build
-it, boot it in QEMU and check it. Everything below is what we decided, what is still open, and
-how to work with the repo.
+- Kernel base: mainline Linux 7.3.0-rc7, commit `0fcb05b72` (pinned in `BASE_COMMIT`)
+- `pidmon_start` is syscall **473** and `pidmon_read` is **474** (x86-64 and i386; 472 was already taken by `fchroot`)
 
-- Kernel base: mainline **Linux 7.3.0-rc7+**, commit `0fcb05b72` (14 Oct 2026), pinned in `BASE_COMMIT`
-- Syscall name / number (proposed): **`pidmon`, 473** on x86-64 (472 was already `fchroot`)
-- Status: harness and stub syscall done and passing; the real implementation is not written yet (see [Status](#status))
-
----
-
-## 1. The problem in plain words
-
-A parent process often starts children and wants to keep an eye on them: how much CPU have they
-burned, how much memory do they hold, how many threads? If one runs away, the parent wants the
-kernel to deal with it. Linux has pieces of this, but nothing that says "tell me about my
-descendant and act on it in one call", so we add a syscall.
-
-Two rules define it:
-
-1. **Report and enforce.** Return resource usage for the target and take an action if a limit is exceeded.
-2. **Authority comes from ancestry.** The target must be the caller or in the caller's descendant
-   tree. A sibling, a parent, an unrelated process or pid 1 is refused (`EPERM`).
-
-### Why not use what already exists?
-
-| Existing tool | What it does | What it lacks |
-|---|---|---|
-| `getrusage(RUSAGE_CHILDREN)` | Usage of children that have **exited and been waited for** | Nothing about live descendants, no grandchildren view |
-| `prlimit(pid, ...)` | Reads/sets the limits of a process | Reports no usage, takes no action |
-| `/proc/<pid>/stat, status` | Read-only text for any visible process | Text parsing, racy, no ancestry rule, no action |
-| Kernel rlimit enforcement | `RLIMIT_CPU` -> `SIGXCPU`/`SIGKILL` by timers; `RLIMIT_AS` -> `mmap` fails | **`RLIMIT_RSS` is never enforced**; event-driven only, nothing on demand |
-
-So the new part is a tree-scoped report plus on-demand enforcement under the caller's control,
-including for resources the kernel never enforces (RSS). With *pure rlimits* as the limit source
-there is real overlap for CPU and address space; that is open question 2 below.
-
----
-
-## 2. The part that is easy to get wrong: "descendant"
-
-A process's parent can change. When a parent exits before its child, the child is **reparented**
-(to another thread of the same group, else the nearest "subreaper", else pid 1). After that it is
-no longer in the old ancestor's tree, and the old ancestor loses authority over it. Our check
-must therefore use the *current* genealogy, not a remembered one.
-
-Facts the implementation relies on:
-
-- The user-visible pid is the **TGID** (thread group id). We work on `group_leader`, never on a single thread.
-- Use **`real_parent`** (genealogy). `parent` can be changed by ptrace and must not be used.
-- Walk `real_parent` upward from the target under `rcu_read_lock()`. If we reach the caller's
-  thread group (`same_thread_group`), it is allowed; if we reach `init_task` first, return `EPERM`.
-- Look the pid up with `find_task_by_vpid` (caller's pid namespace). Take references
-  (`get_task_struct`, `get_pid`) before leaving RCU so a recycled pid cannot be hit (TOCTOU).
-- Never sleep inside the RCU read section.
-- Signals go out with `kill_pid(spid, sig, 1)` (`SEND_SIG_PRIV`), which skips the normal uid /
-  `CAP_KILL` check. That is intentional: **ancestry is the authorization**. Delivery is asynchronous.
-
----
-
-## 3. Proposed interface
+## How it works
 
 ```c
-long pidmon(pid_t pid, unsigned int flags,
-            struct pidmon_usage __user *uattr, size_t usize);
+long pidmon_start(pid_t pid, unsigned int flags);                    /* 473 */
+long pidmon_read (pid_t pid, unsigned int flags,
+                  struct pidmon_usage __user *uattr, size_t usize);  /* 474 */
 ```
 
-`include/uapi/linux/pidmon.h`:
+1. `pidmon_start(pid, 0)` opens a monitoring window on `pid` (`0` means the caller itself).
+2. The target runs. Later, `pidmon_read(pid, flags, &usage, sizeof(usage))` returns what it used
+   during the window, compares that with the target's `rlimit`s, and signals it if a limit is exceeded.
 
-```c
-struct pidmon_usage {              /* PIDMON_USAGE_SIZE_VER0 = 48 bytes */
-    __u64 utime_ns, stime_ns;      /* CPU time of the whole thread group */
-    __u64 rss_bytes, vm_bytes;     /* resident / virtual memory */
-    __u32 nr_threads;
-    __u32 action;                  /* PIDMON_ACT_NONE / WARNED / KILLED */
-    __u32 exceeded;                /* bitmask of which limits were over */
-    __u32 __pad;
-};
-```
+`pid` is a thread-group id in the caller's pid namespace. The target must be the caller or a
+descendant, judged from the **current** parent chain at every call. If a parent dies and its child is
+reparented (to init or a subreaper), the old ancestor loses access.
 
-- `pid == 0` means "myself".
-- `flags`: `PIDMON_F_NO_ENFORCE` (report only, dry run); unknown bits -> `EINVAL`. `PIDMON_F_VALID` is the mask of known bits.
-- `usize` lets the struct grow in future versions (same pattern as `clone3` / `openat2`), copied with `copy_struct_to_user`.
-- Errors: `EINVAL` (bad flags/size/pid), `ESRCH` (no such pid), `EPERM` (not self/descendant), `EFAULT` (bad user pointer).
+**Flags for `pidmon_read`:** `PIDMON_F_NO_ENFORCE` reports without signalling; `PIDMON_F_STOP` releases the
+monitor after reading. `usize` lets the struct grow later, like `clone3`: at least 328 bytes, at most one page.
 
-The assignment only says "given the pid". Whether we may add the struct, size and flags is
-question 1 below; a pid-only signature would force the report into the return value, which cannot
-carry several numbers.
+| Call | Errors |
+|---|---|
+| `pidmon_start` | `EINVAL` bad flags or pid, `ESRCH` no such process, `EPERM` not self or a descendant, `EBUSY` already monitored, `ENOSPC` 64 monitors already held, `ENOMEM`, `EINTR` |
+| `pidmon_read` | `EINVAL`/`E2BIG` bad flags, pid or size, `ENOENT` no monitor for that pid, `ESRCH` target gone and nothing was kept, `EPERM` target left the caller's tree, `EFAULT` bad pointer |
 
-### Algorithm (what `kernel/pidmon.c` will do)
+### What `pidmon_read` returns
 
-1. Validate `flags`, `usize`, `pid`.
-2. Under RCU: find the target (`pid == 0` -> `current`), take its `group_leader`.
-3. Walk `real_parent` upward; no path to the caller's thread group -> `EPERM`.
-4. Take references (`get_task_struct`, `get_pid(task_tgid)`), leave RCU.
-5. Collect: CPU via `thread_group_cputime_adjusted`, RSS via `get_mm_rss` (approximate, per-cpu batched), VM via `mm->total_vm` (`get_task_mm`/`mmput`), `get_nr_threads`.
-6. Judge against limits (CPU, address space, RSS). Soft limit exceeded -> warning signal; hard limit -> `SIGKILL`.
-7. `copy_struct_to_user` first, then `kill_pid(...)` unless `NO_ENFORCE`. (Report even if we kill.)
-8. `put_pid`, `put_task_struct`.
+`struct pidmon_usage` (328 bytes, in `include/uapi/linux/pidmon.h`). Counters are the change since
+`pidmon_start`, sizes are the value now, and peaks are measured since `pidmon_start`.
 
-### Files we change in the kernel (and why)
+| Group | Fields |
+|---|---|
+| header | `size`, `state` (`EXITED`, `ALREADY_SIGNALLED`), `exceeded_soft`, `exceeded_hard`, `signal_sent` |
+| time | `wall_ns` (length of the window) |
+| CPU | `utime_ns`, `stime_ns`, `cpu_total_ns` (since the process began), `cpu_permille` (1000 = one CPU fully busy), `vol_ctxsw`, `invol_ctxsw` |
+| page faults | `minor_faults`, `major_faults` |
+| I/O | `rchar`, `wchar`, `read_bytes`, `write_bytes` |
+| memory (bytes) | `rss_bytes`, `rss_anon`, `rss_file`, `rss_peak`, `vm_bytes`, `vm_peak`, `data_vm`, `stack_vm`, `locked_vm` |
+| process | `nr_threads`, `nr_open_fds` |
+| limits | soft and hard value of CPU, AS, RSS, DATA, STACK, MEMLOCK, NOFILE |
+
+### Enforcement
+
+The target's own rlimits are the limits. These seven are compared with a matching usage number
+(the other rlimits have none): CPU with total CPU seconds, AS with virtual size, RSS with resident size,
+DATA, STACK (main-thread stack), MEMLOCK, and NOFILE with open descriptors.
+
+- Over a **soft** limit: `SIGXCPU` for CPU, `SIGTERM` for the rest.
+- Over a **hard** limit: `SIGKILL`.
+- Each severity is sent once per monitor; a later read still reports the violation but sets `ALREADY_SIGNALLED`.
+- Enforcement happens when `pidmon_read` is called, not in the background.
+- Signals are sent without a uid or `CAP_KILL` check: being the ancestor is the authorization.
+- The kernel already enforces `RLIMIT_CPU` and `RLIMIT_AS` itself; `RLIMIT_RSS` it never enforces, so `pidmon_read` is where that one bites.
+
+### Design notes
+
+- **No timer.** `start` remembers the counters and `read` subtracts. Peak memory comes from the kernel's own high-water marks, reset at `start` (this also resets the target's `VmHWM` in `/proc`).
+- **One monitor per target.** A second `start` on the same pid returns `EBUSY`, because resetting the peaks for one owner would corrupt another's window. An owner holds at most 64.
+- **A child that already exited can still be read.** A small hook in `do_exit()` saves the final numbers of a monitored process before its memory is freed, so reading after the child was reaped still works (`EXITED` is set). If it was orphaned before it died, its numbers are withheld (`EPERM`).
+- **Lifetime.** Each monitor record names its target by `struct pid`, not by task pointer, so a recycled pid number cannot be confused with it. Records hang off the owner and are freed on `PIDMON_F_STOP` or when the owner exits. Forked children do not inherit them.
+- **A pid is a whole process.** CPU is summed over all its threads and memory is read once from the shared address space. A thread id that is not a process id gives `ESRCH`.
+
+## Kernel changes
 
 | File | Change |
 |---|---|
-| `linux/kernel/pidmon.c` (new) | The syscall (currently a stub returning 42) |
-| `linux/include/uapi/linux/pidmon.h` (new) | User-visible struct and flags; also fixes "struct declared inside parameter list" |
-| `linux/kernel/Makefile` | `obj-y += pidmon.o` |
-| `linux/include/linux/syscalls.h` | Prototype `sys_pidmon` |
-| `linux/arch/x86/entry/syscalls/syscall_64.tbl` | `473 common pidmon sys_pidmon` (generates the dispatch table) |
-| `linux/arch/x86/entry/syscalls/syscall_32.tbl` | Same for 32-bit |
-| `linux/include/uapi/asm-generic/unistd.h` | `__NR_pidmon 473`, `__NR_syscalls` bumped (covers arm64 and others) |
-| `linux/scripts/syscall.tbl` | Generic table entry |
+| `kernel/pidmon.c` (new) | both syscalls, record bookkeeping, the exit hook |
+| `include/uapi/linux/pidmon.h` (new) | user-visible struct, flags, limit indices |
+| `include/linux/pidmon.h` (new) | the exit hook declaration |
+| `kernel/exit.c` | one call to the hook in `do_exit()` |
+| `include/linux/sched/signal.h` | `pidmon_recs` list head in `signal_struct` |
+| `include/linux/syscalls.h`, `kernel/Makefile` | prototypes, build rule |
+| `arch/x86/entry/syscalls/syscall_64.tbl`, `syscall_32.tbl`, `include/uapi/asm-generic/unistd.h`, `scripts/syscall.tbl` | syscall numbers 473 and 474 |
 
-`./scripts/60-mkpatch.sh` produces `pidmon.patch`: exactly these changes against the pinned base.
+`./scripts/60-mkpatch.sh` writes `pidmon.patch`, which contains exactly these changes against `BASE_COMMIT`.
+The test kernel config (`kconfig/tiny.config`) also turns on `TASKSTATS`, `TASK_XACCT` and
+`TASK_IO_ACCOUNTING`, so the I/O fields are filled in; without them they read 0.
 
----
+## Build and test
 
-## 4. Questions for the professor (not yet answered)
+Everything is built and tested in a small QEMU virtual machine, never on the host's own kernel.
+The VM boots our kernel with an initramfs that contains a **static busybox** and the test programs.
+Its `/init` runs every test, checks the kernel log for `BUG:`, `WARNING:`, `Oops` and `KASAN:`
+reports, and prints a verdict that the host script turns into `PASS`, `FAIL` or `TIMEOUT`.
 
-The behaviour that is easy to get wrong is exactly what the statement leaves open. Until these are
-answered our choices are assumptions.
+Two kernel profiles: `tiny` (minimal config, fast) and `debug` (adds KASAN, lockdep, RCU and
+atomic-sleep checks, panic on oops).
 
-1. **Interface.** May the signature add an output-struct pointer, a size argument and a flags argument (as `clone3` / `openat2` do), or must it be pid-only with the result in the return value?
-   *Why size and flags:* `usize` lets the struct grow without breaking old programs; `flags` is the standard way to add options later (we use it for the dry-run mode). Both are cheap now and impossible to retrofit.
-2. **Source of the limits.** The kernel already enforces `RLIMIT_CPU` and `RLIMIT_AS` by itself. Should we use the target's existing rlimits, or do you want a separate limit mechanism (fixed thresholds, or limits set through another call)? If separate, we need somewhere to store them (e.g. in `signal_struct`) and a way to set them, which probably changes the interface.
-3. **Which resources count.** CPU time, resident memory, virtual memory, threads? Anything else (open files, I/O)?
-4. **What "appropriate action" means.** Warn (`SIGXCPU`/`SIGTERM`) at the soft limit and `SIGKILL` at the hard limit? Report only? Is a dry-run flag acceptable?
-5. **Name and deliverables.** Is the name ours to choose (we propose `pidmon`)? What do you want handed in: a patch against mainline, a source tree, a demo on another machine, a report?
-
----
-
-## 5. Repository layout
-
-```
-systemcall/
-├── linux/                     kernel source: mainline 0fcb05b72 + our changes (a plain folder, not a nested repo)
-├── scripts/                   build / boot / test scripts
-├── tests/                     user-space tests, one C file each (NN_name.c)
-├── kconfig/                   tiny.config, debug.config (kernel config fragments)
-├── pidmon_syscall_guide.tex   LaTeX write-up (design, background, implementation steps, tests)
-├── pidmon_syscall_guide.pdf
-├── BASE_COMMIT                mainline commit the kernel is based on
-└── build-*/ hdr/ rootfs/ out/ generated, git-ignored
-```
-
-Why one repo with the kernel inside: we share everything with a single clone, pull and push.
-Why the kernel is a plain folder and not a fork: a fork needs a second repo and a second push for
-every change, and the history of the kernel is irrelevant to us. The base is pinned in
-`BASE_COMMIT` so both of us build exactly the same kernel and the final patch can be rebuilt.
-
----
-
-## 6. How we build and test: QEMU + busybox
-
-Compiling and rebooting a real machine for every edit would be slow and risky. Instead:
-
-- A **minimal kernel** (`tinyconfig` + `kconfig/tiny.config`, only what is needed to boot, mount `/proc` and run a static binary) builds in a few minutes the first time and seconds afterwards (ccache, incremental).
-- A tiny **initramfs** with a static **busybox** and our compiled tests is the whole userland.
-- **QEMU** (with KVM when available) boots it and the guest `/init` runs every `/tests/*`, greps `dmesg` for `BUG:`, `WARNING:`, `Oops`, `KASAN`, `lockdep`, prints `PIDMON_EXIT=<n>` and powers off with `reboot -f` (tinyconfig has no ACPI, so `poweroff` would not stop QEMU).
-- The host script turns that into one line: **`RESULT: PASS` / `FAIL` / `TIMEOUT`**.
-
-Two profiles share the scripts: `PROFILE=tiny` (default, fast) and `PROFILE=debug` (KASAN, lockdep, atomic-sleep and list checks, `panic_on_oops`), each in its own build directory.
-
-### Will it work on "another OS"?
-
-The syscall lives in the kernel source, so any kernel built from this source has it. For the
-demo, build the same source with the target machine's config (e.g. its `/boot/config-*` plus
-`make olddefconfig`) and boot that kernel on another **Linux** install or VM. It is not portable to
-Windows, macOS or BSD. Things to remember:
-
-- Run the test suite once with a full distro-style config in QEMU too; preemption, cgroups and RSS accounting differ from tinyconfig.
-- glibc has no wrapper: tests call `syscall(473, ...)` and compile against the headers from `make headers_install` (`hdr/`), not the host's.
-- ARM64 is covered by the generic `unistd.h` change; x86 needs the `.tbl` entries (done).
-- Add a test that drops to an unprivileged uid, since "ancestry is the authorization" matters most there.
-
----
-
-## 7. Setup and daily use
-
-**Host tools** (`./scripts/00-deps.sh` checks them): gcc, make, bc, flex, bison, cpio, gzip, file,
-qemu-system-x86_64, and a **static busybox** (`pacman -S busybox`; on Debian/Ubuntu
-`apt install busybox-static`; or set `BUSYBOX=/path`). `ccache` and `/dev/kvm` are optional but make it much faster.
+You need gcc, make, bc, flex, bison, cpio, gzip, file, qemu-system-x86_64 and a static busybox
+(`./scripts/00-deps.sh` checks). KVM and ccache are optional but much faster.
 
 ```bash
-git clone --depth 1 https://github.com/vajradevam/systemcall.git
-cd systemcall
-./scripts/00-deps.sh
-./scripts/run-all.sh          # config (once) + build + initramfs + QEMU + result
+./scripts/run-all.sh                    # config (first time), build, initramfs, boot, result
+PROFILE=debug ./scripts/run-all.sh      # same with the debug kernel
+./scripts/run-all.sh --rootfs-only      # only tests changed: skip the kernel rebuild
+./scripts/50-run.sh --gdb               # boot paused, gdb on :1234
+./scripts/60-mkpatch.sh                 # write pidmon.patch
 ```
 
-| Command | What it does |
+### Tests (`tests/`)
+
+Each test forks its own process tree, so a kill cannot hit the runner. Both profiles pass.
+
+| Test | What it checks |
 |---|---|
-| `./scripts/run-all.sh` | Whole loop |
-| `PROFILE=debug ./scripts/run-all.sh` | Same with KASAN / lockdep kernel |
-| `./scripts/run-all.sh --rootfs-only` | Only tests changed: skip the kernel rebuild |
-| `./scripts/50-run.sh --gdb` | Boot paused, gdb on `:1234` |
-| `RUN_TIMEOUT=300 ./scripts/50-run.sh` | Longer timeout for slow machines |
-| `./scripts/60-mkpatch.sh` | Write `pidmon.patch` (our kernel changes vs `BASE_COMMIT`) |
+| `00_smoke` | the VM boots and runs a static binary |
+| `10_args` | struct size, every argument error, `STOP`, oversized buffers, the 64-monitor cap |
+| `20_tree` | self, child, grandchild allowed; parent, sibling, init refused; orphans refused; a subreaper keeps access |
+| `30_usage` | reported CPU, faults, memory, fds and limits agree with `/proc` and `prlimit` |
+| `40_window` | peaks and counters cover only the time since `start` |
+| `50_enforce` | soft warning once, `NO_ENFORCE`, hard kill, NOFILE, CPU, monitoring yourself |
+| `60_exit` | a zombie, a reaped child and a killed child keep their numbers; an owner exiting with monitors |
+| `70_threads` | CPU summed over threads, memory counted once, a group whose main thread already exited |
+| `80_ns` | pid namespaces: numbers are resolved in the caller's namespace |
+| `90_stress` | threads and processes racing `start`/`read`/`STOP`/kill against exiting targets |
+| `95_unpriv` | an unprivileged owner can signal a root-owned descendant that `kill(2)` would refuse |
 
-The scripts, in order: `00-deps` (check tools), `20-config` (tinyconfig + fragments, warns about
-dropped options), `30-build` (bzImage + `headers_install`), `40-rootfs` (busybox + tests ->
-initramfs), `50-run` (QEMU), `run-all` (all of it).
+### What ran where
 
-**Working together:** `git pull --rebase`, edit, `./scripts/run-all.sh`, `git add -A`, `git commit`, `git push`.
-To avoid conflicts, one person owns `linux/kernel/pidmon.c` and the kernel side; the other owns
-`tests/` and the docs. Commit often and pull before starting.
-
----
-
-## 8. Status
-
-Done:
-- [x] Harness: minimal config, static busybox initramfs, QEMU with KVM, PASS/FAIL/TIMEOUT detection, debug profile
-- [x] Stub syscall 473 wired through tables, prototype, UAPI header and build; user space sees `pidmon() = 42`
-- [x] Verified end to end from a fresh clone of this repo
-
-Next, in order:
-1. Verify helper signatures in this tree (`thread_group_cputime_adjusted`, `task_rlimit`, `copy_struct_to_user`, `kill_pid`, `get_mm_rss`).
-2. Authorization only (ancestry walk) plus relationship tests.
-3. Usage collection, cross-checked against `/proc`.
-4. Limit judging with `NO_ENFORCE`.
-5. Signalling.
-6. Edge cases: reparenting, multithreaded targets, zombies, PID namespaces.
-7. Run everything under `PROFILE=debug` with a clean `dmesg`.
-8. Stress test (fork-chain loop).
-9. Polish: `checkpatch.pl --strict`, selftest, docs, patch.
-10. Rebuild the LaTeX guide and PDF with the final results.
-
-### Test matrix (to be written in `tests/`)
-
-Each case forks its own process tree so a kill cannot take down the test runner.
-
-| Case | Expected |
-|---|---|
-| self (`pid` = own pid, and `pid` = 0) | OK, usage returned |
-| child, grandchild | OK |
-| parent, sibling, pid 1 | `EPERM` |
-| nonexistent pid | `ESRCH` |
-| bad flags / bad `usize` / negative pid | `EINVAL` |
-| bad user pointer | `EFAULT` |
-| CPU hard limit exceeded | target killed |
-| RSS soft limit exceeded | warned |
-| `NO_ENFORCE` | reported, never signalled |
-| orphan reparented to init | now `EPERM` for the old ancestor |
-| multithreaded target, zombie target | correct totals / sensible result |
-| process in a child PID namespace (`CLONE_NEWPID`) | resolved in the caller's namespace |
-| unprivileged caller on its own child | OK |
-
----
-
-## 9. Problems met so far (and fixes)
-
-| Problem | Cause | Fix |
+| | Environment | busybox |
 |---|---|---|
-| `struct pidmon_usage declared inside parameter list` | struct not visible to `syscalls.h` | `include/uapi/linux/pidmon.h`, included by `kernel/pidmon.c` |
-| `RESULT: TIMEOUT` with no output in a real terminal | `timeout` runs QEMU in a background process group; reading the tty stops it (SIGTTIN) | `</dev/null` in `50-run.sh` |
-| "busybox is not static" for a static busybox | `ldd` exits non-zero on static files under `set -o pipefail` | check with `file -L ... | grep 'statically linked'` |
-| QEMU never exits after the tests | tinyconfig has no ACPI | `reboot -f` + `-no-reboot` + `reboot=k` |
-| Struct size said 40, really 48 | 4 x 8 + 4 x 4 | `PIDMON_USAGE_SIZE_VER0 = 48` |
-| Four kernel files missing after the push | ignore rule `hdr/` matched kernel folders named `hdr` | anchored the ignore rules to the repo root (`/hdr/`) |
+| All development and every test run | QEMU VM, `tiny` and `debug` kernels | yes |
+| `demo/pidmon_demo.c`, first runs | the same QEMU VM (`demo/run-demo-qemu.sh`) | yes |
+| `demo/pidmon_demo.c`, native run | lab machine `d153-system`, Ubuntu 24.04, booted into our kernel (built from its own distro config) | no |
+| The test suite on that Ubuntu machine | not run | n/a |
 
----
+So the KASAN and lockdep checks cover only the QEMU `debug` kernel. On the Ubuntu kernel we confirmed
+only that the kernel log has no `BUG:`, `WARNING:` or `Oops` lines. Some tests assume the busybox VM
+(for example, orphans being adopted by pid 1) and would need changes to run on a systemd machine.
 
-## 10. Further reading
+## Demo
 
-- `pidmon_syscall_guide.pdf` / `.tex`: design, background, step-by-step implementation, test plan
-- `linux/Documentation/process/adding-syscalls.rst`: the kernel's own checklist
-- `linux/kernel/sys.c` (`getrusage`, `prlimit`), `linux/kernel/signal.c` (`kill_pid_info`): code we model ours on
+`demo/pidmon_demo.c` walks through the features and prints the results: monitoring yourself, the
+ancestry rule, an orphaned grandchild, a full usage report, soft and hard limit enforcement, and
+reading a child that already exited.
+
+```bash
+gcc -O1 -Wall -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_demo.c
+./pidmon_demo
+```
+
+- `demo/run-demo-qemu.sh <bzImage> <headers dir>` runs it inside QEMU against any kernel build.
+- `demo/install-kernel.sh` installs a kernel built in `~/pidmon/build-ubuntu` on an Ubuntu machine
+  (modules, `/boot`, initramfs, `update-grub`). It needs sudo and does not reboot.
+- The headers come from `make headers_install`. Without them a program can use the raw numbers 473 and 474.
+
+## Doubts
+
+1. Is enforcement at `pidmon_read` time enough, or must a limit be enforced in the background between calls? That would need a timer or a hook in the page-fault path.
+2. Are a time-weighted average of memory and the peak CPU % in a single interval required? Both need sampling. We report totals, the window-average CPU and peak memory.
+3. Is one monitor per target acceptable?
+
+## Somethings
+
+- When the kernel signals a process at its soft `RLIMIT_CPU`, it also raises that soft limit by one second, so by the time `pidmon_read` looks the limit may have moved. The CPU tests therefore check our verdict against the numbers we report, and use the hard limit for the deterministic case.
+- Run QEMU with `</dev/null` under `timeout` (the scripts do): otherwise it stops waiting to read the terminal.
+- The tiny kernel has no ACPI, so the guest ends with `reboot -f` rather than `poweroff`.
+- Read next: `linux/Documentation/process/adding-syscalls.rst`, and `getrusage` in `linux/kernel/sys.c`, which this code follows.
