@@ -5,11 +5,13 @@
  *
  * The two calls (glibc has no wrapper, so we use syscall(2)):
  *
- *   pidmon_start(pid, 0)                     open a monitoring window on pid (0 = myself)
- *   pidmon_read(pid, flags, &usage, size)    report what happened in the window, compare it with
- *                                            the target's rlimits and signal it if one is exceeded
- *     flags: PIDMON_F_NO_ENFORCE  report only, never signal
- *            PIDMON_F_STOP        free the monitor after reading
+ *   pidmon_start(pid, flags, &limits, size)  open a monitoring window on pid (0 = myself) and arm
+ *                                            its limits; from then on the kernel watches the
+ *                                            target and warns (soft) or kills (hard) it by itself
+ *     limits: soft/hard values for any of the 7 limits; the others (or NULL) use the target's rlimits
+ *     flags:  PIDMON_F_NO_ENFORCE  judge and report only, never signal
+ *   pidmon_read(pid, flags, &usage, size)    report what happened in the window; never signals
+ *     flags:  PIDMON_F_STOP        free the monitor after reading
  *
  * The demo has six scenarios (see main). Several of them need a second process doing something
  * on cue, so each "actor" runs in a forked child and takes its cues from the parent through a pipe.
@@ -83,9 +85,15 @@ static double to_percent(uint64_t permille) { return (double)permille / PERMILLE
 /* ---- the two system calls ------------------------------------------------------------------ */
 
 /* Both return 0 on success or the errno value, which keeps the call sites short. */
+static int pm_start_lim(pid_t pid, unsigned int flags, const struct pidmon_limits *lim)
+{
+	return syscall(__NR_pidmon_start, pid, flags, lim, lim ? sizeof(*lim) : 0) < 0 ? errno : 0;
+}
+
+/* the target's own rlimits are the limits */
 static int pm_start(pid_t pid)
 {
-	return syscall(__NR_pidmon_start, pid, 0) < 0 ? errno : 0;
+	return pm_start_lim(pid, 0, NULL);
 }
 
 static int pm_read(pid_t pid, unsigned int flags, struct pidmon_usage *u)
@@ -173,8 +181,6 @@ static void show(const struct pidmon_usage *u)
 
 	if (u->state & PIDMON_ST_EXITED)
 		note = " | target has EXITED (these are its final numbers)";
-	else if (u->state & PIDMON_ST_ALREADY_SIGNALLED)
-		note = " | this severity was signalled by an earlier read";
 
 	printf("    window %7.1f ms | cpu %6.1f ms (user %.1f, sys %.1f) = %.1f%% of one cpu | total cpu since start %.1f ms\n",
 	       to_ms(u->wall_ns), to_ms(u->utime_ns + u->stime_ns), to_ms(u->utime_ns), to_ms(u->stime_ns),
@@ -185,7 +191,7 @@ static void show(const struct pidmon_usage *u)
 	printf("    faults: %llu minor, %llu major | context switches: %llu voluntary, %llu forced | threads %llu | open fds %llu\n",
 	       ULL(u->minor_faults), ULL(u->major_faults), ULL(u->vol_ctxsw), ULL(u->invol_ctxsw),
 	       ULL(u->nr_threads), ULL(u->nr_open_fds));
-	printf("    io: %llu B read, %llu B written | limits over: soft [%s] hard [%s] | signal sent: %s%s\n",
+	printf("    io: %llu B read, %llu B written | limits over: soft [%s] hard [%s] | signal sent in the window: %s%s\n",
 	       ULL(u->rchar), ULL(u->wchar), limit_list(u->exceeded_soft), limit_list(u->exceeded_hard),
 	       signame(u->signal_sent), note);
 }
@@ -216,9 +222,14 @@ static int wait_msg(int fd, int timeout_ms)
 	fd_set set;
 	char c;
 
-	FD_ZERO(&set);
-	FD_SET(fd, &set);
-	if (select(fd + 1, &set, NULL, NULL, &tv) <= 0 || read(fd, &c, 1) != 1)
+	int n;
+
+	do {	/* a signal (the warning, say) must not look like a cue; select leaves the time left in tv */
+		FD_ZERO(&set);
+		FD_SET(fd, &set);
+		n = select(fd + 1, &set, NULL, NULL, &tv);
+	} while (n < 0 && errno == EINTR);
+	if (n <= 0 || read(fd, &c, 1) != 1)
 		return -1;
 	return (unsigned char)c;
 }
@@ -354,11 +365,9 @@ static void on_sigterm(int sig)
 static void actor_greedy(int from_parent, int to_parent)
 {
 	struct sigaction sa = { .sa_handler = on_sigterm };
-	struct rlimit limit = { .rlim_cur = RSS_SOFT_MB * BYTES_PER_MB, .rlim_max = RSS_HARD_MB * BYTES_PER_MB };
 
 	sigterm_report_fd = to_parent;
-	sigaction(SIGTERM, &sa, NULL);
-	setrlimit(RLIMIT_RSS, &limit);
+	sigaction(SIGTERM, &sa, NULL);		/* no rlimit of its own: the window brings the limits */
 
 	touch_memory_mb(RSS_FIRST_MB);
 	send_msg(to_parent, MSG_READY);
@@ -468,44 +477,63 @@ static void demo_report(void)
 	waitpid(worker, NULL, 0);
 }
 
-/* 5. Enforcement: soft limit warns once, NO_ENFORCE only reports, hard limit kills. */
+/* limits for the greedy child: RSS soft RSS_SOFT_MB, hard RSS_HARD_MB */
+static void greedy_limits(struct pidmon_limits *lim)
+{
+	memset(lim, 0, sizeof(*lim));
+	lim->set = 1U << PIDMON_LIM_RSS;
+	lim->lim[PIDMON_LIM_RSS].soft = RSS_SOFT_MB * BYTES_PER_MB;
+	lim->lim[PIDMON_LIM_RSS].hard = RSS_HARD_MB * BYTES_PER_MB;
+}
+
+/* 5. Enforcement in the window: no read is needed. Soft limit warns once, hard limit kills. */
 static void demo_enforcement(void)
 {
+	struct pidmon_limits lim;
 	struct pidmon_usage u;
 	int cue, report, status;
 	pid_t greedy;
 
-	title("5. Enforcement: RSS limit soft %d MB / hard %d MB (Linux never enforces RLIMIT_RSS itself)",
+	title("5. Enforcement: RSS limit soft %d MB / hard %d MB, given to pidmon_start (Linux never enforces RLIMIT_RSS itself)",
 	      RSS_SOFT_MB, RSS_HARD_MB);
 	greedy = spawn(actor_greedy, &cue, &report);
 	wait_msg(report, WAIT_NORMAL_MS);			/* it now holds RSS_FIRST_MB */
 	printf("  the child holds %d MB: over the soft limit, under the hard limit\n", RSS_FIRST_MB);
-	say("pidmon_start(greedy)", pm_start(greedy));
+	greedy_limits(&lim);
+	say("pidmon_start(greedy, RSS limits)", pm_start_lim(greedy, 0, &lim));
 
-	say("pidmon_read #1: over the soft limit", pm_read(greedy, 0, &u));
-	show(&u);
-	printf("    child says: %s\n", wait_msg(report, WAIT_QUICK_MS) == MSG_TERM ?
+	printf("  no read yet: the window itself warns the child within about 10 ms\n");
+	printf("    child says: %s\n", wait_msg(report, WAIT_NORMAL_MS) == MSG_TERM ?
 	       "I received SIGTERM (a warning, I can still react)" : "no signal arrived?!");
 
-	say("pidmon_read #2: still over, but already warned", pm_read(greedy, 0, &u));
+	say("pidmon_read #1: reports the breach", pm_read(greedy, 0, &u));
 	show(&u);
-
-	say("pidmon_read #3 with NO_ENFORCE (report only)", pm_read(greedy, PIDMON_F_NO_ENFORCE, &u));
-	printf("    signal sent: %s\n", signame(u.signal_sent));
+	say("pidmon_read #2: reading again signals nothing", pm_read(greedy, 0, &u));
+	show(&u);
+	printf("    child says: %s\n", wait_msg(report, WAIT_QUICK_MS) == MSG_TERM ?
+	       "a second SIGTERM?!" : "(no second warning)");
 
 	send_msg(cue, MSG_GO);					/* grow past the hard limit */
-	wait_msg(report, WAIT_NORMAL_MS);
-	printf("  the child now holds %d MB: over the hard limit\n", RSS_FIRST_MB + RSS_GROW_MB);
-	say("pidmon_read #4", pm_read(greedy, 0, &u));
-	show(&u);
-
 	waitpid(greedy, &status, 0);
+	printf("  the child grew to %d MB: over the hard limit, and nobody called pidmon_read\n",
+	       RSS_FIRST_MB + RSS_GROW_MB);
 	if (WIFSIGNALED(status))
 		printf("    child ended: killed by signal %d (%s)\n", WTERMSIG(status), signame(WTERMSIG(status)));
 	else
 		printf("    child ended: exit status %d\n", WEXITSTATUS(status));
-	say("pidmon_read #5 after it was killed and reaped", pm_read(greedy, 0, &u));
+	say("pidmon_read #3 after it was killed and reaped", pm_read(greedy, 0, &u));
 	show(&u);
+
+	printf("\n  the same breach in a PIDMON_F_NO_ENFORCE window is reported but not acted on:\n");
+	greedy = spawn(actor_greedy, &cue, &report);
+	wait_msg(report, WAIT_NORMAL_MS);
+	say("pidmon_start(greedy, NO_ENFORCE)", pm_start_lim(greedy, PIDMON_F_NO_ENFORCE, &lim));
+	printf("    child says: %s\n", wait_msg(report, WAIT_QUICK_MS) == MSG_TERM ?
+	       "I received SIGTERM?!" : "(no signal, as asked)");
+	say("pidmon_read", pm_read(greedy, PIDMON_F_STOP, &u));
+	show(&u);
+	kill(greedy, SIGKILL);
+	waitpid(greedy, NULL, 0);
 }
 
 /* 6. A child that exits and is reaped before we read: its numbers are kept. */
