@@ -10,7 +10,7 @@ file -L "$BB" | grep -q 'statically linked' || { echo "busybox at $BB is not sta
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"/{bin,proc,sys,dev,tmp}
 cp "$BB" "$W/bin/busybox"
-gcc -static -O1 -Wall -isystem "$HDR/include" -o "$W/bin/pidmon_demo" "$HERE/pidmon_demo.c"
+gcc -static -O1 -Wall -pthread -isystem "$HDR/include" -o "$W/bin/pidmon_demo" "$HERE/pidmon_demo.c"
 cat > "$W/init" <<'INIT'
 #!/bin/busybox sh
 export PATH=/bin
