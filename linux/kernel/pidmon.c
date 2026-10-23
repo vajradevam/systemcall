@@ -3,23 +3,27 @@
  * pidmon: monitor and enforce resource limits on a process in the caller's
  * descendant tree.
  *
- *   pidmon_start(pid, flags)
+ *   pidmon_start(pid, flags, ulim, usize)
  *	Opens a monitoring window on the target: remembers the current values of
- *	all counters and resets the target's peak RSS / peak virtual size.
+ *	all counters, resets the target's peak RSS / peak virtual size and arms
+ *	the limits (those given in @ulim, the target's own RLIMIT_*s for the
+ *	rest).  From then on the limits are enforced until the window ends.
  *
  *   pidmon_read(pid, flags, uattr, usize)
- *	Reports the window's aggregates, compares the target with its
- *	RLIMIT_*s and signals it if a limit is exceeded.
+ *	Reports the window's aggregates and which limits were breached.  It
+ *	never signals anything.
  *
  * Authority is ancestry: the target must be the caller's thread group or a
  * descendant of it, judged by the *current* real_parent chain at every call.
  * A target that was reparented away (orphaned) is no longer ours.
  *
- * No timer or sampler is involved.  Counters are differences against the
- * baseline taken at start; gauges are read when asked; peaks come from the
- * kernel's own hiwater marks.  When the target's last thread exits, the exit
- * hook freezes the final numbers into the record so that a short-lived child
- * can still be read after it has been reaped.
+ * Counters are differences against the baseline taken at start; gauges are
+ * read when asked; peaks come from the kernel's own hiwater marks.  Enforcement
+ * needs someone to look while the caller is not in the kernel, so a delayed work
+ * item samples every live record each PIDMON_POLL_MS and runs only while there
+ * is one.  When the target's last thread exits, the exit hook freezes the final
+ * numbers into the record so that a short-lived child can still be read after
+ * it has been reaped.
  */
 #include <linux/syscalls.h>
 #include <linux/sched/signal.h>
@@ -34,12 +38,16 @@
 #include <linux/math64.h>
 #include <linux/resource.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
+#include <linux/list.h>
 #include <linux/task_io_accounting_ops.h>
 #include <linux/pidmon.h>
 #include <uapi/linux/pidmon.h>
 
 #define PIDMON_MAX_RECS		64	/* records per owner */
 #define PIDMON_RLIM_INF		U64_MAX
+#define PIDMON_POLL_MS		10	/* how often live windows are checked */
+#define PIDMON_LIM_ALL		((1U << PIDMON_NLIM) - 1)
 
 static const unsigned char pidmon_rlimit[PIDMON_NLIM] = {
 	[PIDMON_LIM_CPU]	= RLIMIT_CPU,
@@ -74,7 +82,14 @@ struct pidmon_rec {
 	bool			linked;
 	bool			exited;		/* @final is valid */
 	bool			orphaned;	/* left the owner's tree before it died */
+	bool			noenforce;	/* judge and report only */
 	int			sig_level;	/* 0 none, 1 warned, 2 killed */
+	int			sent_sig;	/* strongest signal sent so far */
+	u32			ever_soft;	/* limits breached at any time in the window */
+	u32			ever_hard;
+	u32			set;		/* limits given by the caller, see @lim */
+	struct pidmon_rlim	lim[PIDMON_NLIM];
+	struct list_head	scan_node;	/* on pidmon_poll's private list */
 	struct pid		*tpid;		/* target thread group */
 	struct pid		*owner;		/* owner thread group */
 	u64			base_wall_ns;
@@ -85,6 +100,9 @@ struct pidmon_rec {
 static DEFINE_SPINLOCK(pidmon_lock);
 static DEFINE_HASHTABLE(pidmon_hash, 6);
 int pidmon_nrecs;
+
+static void pidmon_poll(struct work_struct *work);
+static DECLARE_DELAYED_WORK(pidmon_dwork, pidmon_poll);
 
 static void pidmon_rec_put(struct pidmon_rec *r)
 {
@@ -270,8 +288,8 @@ static u64 pidmon_rlim_val(unsigned long v)
 
 /*
  * Fill @u for target @t (a group member) at time @now, relative to the
- * baseline in @r.  @mm may be NULL (zombie target): memory fields stay 0.
- * Does not sleep.
+ * baseline and with the limits in @r.  @mm may be NULL (zombie target): memory
+ * fields stay 0.  Does not sleep.
  */
 static void pidmon_fill(struct task_struct *t, struct mm_struct *mm,
 			const struct pidmon_rec *r, u64 now,
@@ -327,15 +345,19 @@ static void pidmon_fill(struct task_struct *t, struct mm_struct *mm,
 	u->nr_open_fds = pidmon_count_fds(t);
 
 	for (i = 0; i < PIDMON_NLIM; i++) {
-		u->lim[i].soft = pidmon_rlim_val(task_rlimit(t, pidmon_rlimit[i]));
-		u->lim[i].hard = pidmon_rlim_val(task_rlimit_max(t, pidmon_rlimit[i]));
+		if (r->set & BIT(i)) {
+			u->lim[i] = r->lim[i];
+		} else {
+			u->lim[i].soft = pidmon_rlim_val(task_rlimit(t, pidmon_rlimit[i]));
+			u->lim[i].hard = pidmon_rlim_val(task_rlimit_max(t, pidmon_rlimit[i]));
+		}
 	}
 }
 
 /*
- * Compare the usage in @u with its limits.  Sets the exceeded masks and
- * returns the signal that enforcement calls for (0 for none), with its
- * severity in *level: 1 = warn (soft), 2 = kill (hard).
+ * Compare the usage in @u with its limits.  Sets the exceeded masks (as of
+ * now) and returns the signal that enforcement calls for (0 for none), with
+ * its severity in *level: 1 = warn (soft), 2 = kill (hard).
  */
 static int pidmon_judge(struct pidmon_usage *u, int *level)
 {
@@ -388,21 +410,120 @@ static int pidmon_check_room_locked(struct pid *tpid)
 	return n >= PIDMON_MAX_RECS ? -ENOSPC : 0;
 }
 
-SYSCALL_DEFINE2(pidmon_start, pid_t, pid, unsigned int, flags)
+/* Fold what happened over the whole window into a report. */
+static void pidmon_merge_locked(const struct pidmon_rec *r, struct pidmon_usage *u)
 {
+	u->exceeded_soft |= r->ever_soft;
+	u->exceeded_hard |= r->ever_hard;
+	u->signal_sent = r->sent_sig;
+}
+
+/*
+ * One look at a live record: note any breach and, unless the window is report-only,
+ * answer it.  Each severity is answered once, so a target that stays over its soft
+ * limit is warned once, and one that later passes its hard limit is still killed.
+ */
+static void pidmon_check(struct pidmon_rec *r)
+{
+	struct task_struct *t;
+	struct pidmon_usage u;
+	struct mm_struct *mm;
+	int sig, level, send = 0;
+
+	rcu_read_lock();
+	t = pid_task(r->tpid, PIDTYPE_TGID);
+	/* ancestry is judged all the time: a target that left our tree is not ours to signal */
+	if (!t || !pidmon_in_tree(t, r->owner)) {
+		rcu_read_unlock();
+		return;
+	}
+	get_task_struct(t);
+	rcu_read_unlock();
+
+	mm = pidmon_get_mm(t);
+	pidmon_fill(t, mm, r, ktime_get_ns(), &u);
+	if (mm)
+		mmput(mm);
+	put_task_struct(t);
+
+	sig = pidmon_judge(&u, &level);
+
+	spin_lock(&pidmon_lock);
+	if (r->linked && !r->exited) {	/* stopped or frozen meanwhile: leave it be */
+		r->ever_soft |= u.exceeded_soft;
+		r->ever_hard |= u.exceeded_hard;
+		if (sig && !r->noenforce && r->sig_level < level) {
+			r->sig_level = level;
+			r->sent_sig = send = sig;
+		}
+	}
+	spin_unlock(&pidmon_lock);
+
+	/* ancestry is the authorization, so no uid / CAP_KILL check */
+	if (send)
+		kill_pid(r->tpid, send, 1);
+}
+
+static void pidmon_poll(struct work_struct *work)
+{
+	struct pidmon_rec *r, *next;
+	LIST_HEAD(scan);
+	int bkt;
+
+	spin_lock(&pidmon_lock);
+	hash_for_each(pidmon_hash, bkt, r, hash_node) {	/* live records only: exited ones leave it */
+		refcount_inc(&r->ref);
+		list_add_tail(&r->scan_node, &scan);
+	}
+	spin_unlock(&pidmon_lock);
+
+	if (list_empty(&scan))
+		return;		/* pidmon_start() calls us again when there is something to watch */
+
+	list_for_each_entry_safe(r, next, &scan, scan_node) {
+		list_del(&r->scan_node);
+		pidmon_check(r);
+		pidmon_rec_put(r);
+	}
+	schedule_delayed_work(&pidmon_dwork, msecs_to_jiffies(PIDMON_POLL_MS));
+}
+
+SYSCALL_DEFINE4(pidmon_start, pid_t, pid, unsigned int, flags,
+		const struct pidmon_limits __user *, ulim, size_t, usize)
+{
+	struct pidmon_limits lim = {};
 	struct task_struct *t;
 	struct pidmon_rec *r;
 	struct mm_struct *mm;
 	struct pid *tpid;
-	int ret;
+	int i, ret;
 
-	if (flags || pid < 0)
+	if ((flags & ~PIDMON_START_VALID) || pid < 0)
 		return -EINVAL;
+	if (ulim) {
+		if (usize > PAGE_SIZE)
+			return -E2BIG;
+		if (usize < PIDMON_LIMITS_SIZE_VER0)
+			return -EINVAL;
+		ret = copy_struct_from_user(&lim, sizeof(lim), ulim, usize);
+		if (ret)
+			return ret;
+		if (lim.set & ~PIDMON_LIM_ALL)
+			return -EINVAL;
+		for (i = 0; i < PIDMON_NLIM; i++)
+			if ((lim.set & BIT(i)) && lim.lim[i].soft > lim.lim[i].hard)
+				return -EINVAL;
+	} else if (usize) {
+		return -EINVAL;
+	}
 
 	r = kzalloc_obj(*r);
 	if (!r)
 		return -ENOMEM;
 	refcount_set(&r->ref, 1);
+	r->noenforce = flags & PIDMON_F_NO_ENFORCE;
+	r->set = lim.set;
+	memcpy(r->lim, lim.lim, sizeof(r->lim));
 
 	ret = pidmon_get_target(pid, &t, &tpid);
 	if (ret)
@@ -448,6 +569,8 @@ SYSCALL_DEFINE2(pidmon_start, pid_t, pid, unsigned int, flags)
 		goto out_put;
 	}
 	put_task_struct(t);
+	/* a no-op if the poll is already queued; it queues itself again while it finds work */
+	schedule_delayed_work(&pidmon_dwork, msecs_to_jiffies(PIDMON_POLL_MS));
 	return 0;
 
 out_put:
@@ -466,10 +589,10 @@ SYSCALL_DEFINE4(pidmon_read, pid_t, pid, unsigned int, flags,
 	struct pidmon_usage u;
 	struct pidmon_rec *r;
 	struct mm_struct *mm;
-	int sig = 0, level = 0, ret = 0;
+	int level, ret = 0;
 	bool exited = false, orphaned = false;
 
-	if ((flags & ~PIDMON_F_READ_VALID) || pid < 0)
+	if ((flags & ~PIDMON_READ_VALID) || pid < 0)
 		return -EINVAL;
 	if (usize > PAGE_SIZE)
 		return -E2BIG;
@@ -523,17 +646,10 @@ SYSCALL_DEFINE4(pidmon_read, pid_t, pid, unsigned int, flags,
 		if (!atomic_read(&t->signal->live))
 			u.state |= PIDMON_ST_EXITED;
 
-		sig = pidmon_judge(&u, &level);
-		if (sig && !(flags & PIDMON_F_NO_ENFORCE)) {
-			if (READ_ONCE(r->sig_level) >= level) {
-				u.state |= PIDMON_ST_ALREADY_SIGNALLED;
-				sig = 0;
-			} else {
-				u.signal_sent = sig;
-			}
-		} else {
-			sig = 0;
-		}
+		pidmon_judge(&u, &level);	/* the masks as of now; reading never signals */
+		spin_lock(&pidmon_lock);
+		pidmon_merge_locked(r, &u);
+		spin_unlock(&pidmon_lock);
 	}
 
 	u.size = min_t(size_t, usize, sizeof(u));
@@ -541,17 +657,6 @@ SYSCALL_DEFINE4(pidmon_read, pid_t, pid, unsigned int, flags,
 	if (ret)
 		goto out;	/* no side effects on a failed call */
 
-	if (sig) {
-		spin_lock(&pidmon_lock);
-		if (r->sig_level < level)
-			r->sig_level = level;
-		else
-			sig = 0;
-		spin_unlock(&pidmon_lock);
-		/* ancestry is the authorization, so no uid / CAP_KILL check */
-		if (sig)
-			kill_pid(r->tpid, sig, 1);
-	}
 	if (flags & PIDMON_F_STOP)
 		pidmon_drop(r);
 out:
@@ -597,6 +702,7 @@ void pidmon_exit_group(struct task_struct *tsk)
 
 		spin_lock(&pidmon_lock);
 		if (r->linked) {
+			pidmon_merge_locked(r, &u);
 			r->final = u;
 			r->orphaned = orphaned;
 			r->exited = true;

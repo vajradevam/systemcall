@@ -459,7 +459,9 @@ asmlinkage long sys_fchdir(unsigned int fd);
 asmlinkage long sys_chroot(const char __user *filename);
 asmlinkage long sys_fchroot(int fd, unsigned int flags);
 struct pidmon_usage;
-asmlinkage long sys_pidmon_start(pid_t pid, unsigned int flags);
+struct pidmon_limits;
+asmlinkage long sys_pidmon_start(pid_t pid, unsigned int flags,
+				 const struct pidmon_limits __user *ulim, size_t usize);
 asmlinkage long sys_pidmon_read(pid_t pid, unsigned int flags,
 				struct pidmon_usage __user *uattr, size_t usize);
 asmlinkage long sys_fchmod(unsigned int fd, umode_t mode);

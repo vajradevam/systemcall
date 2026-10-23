@@ -7,22 +7,31 @@
 /*
  * pidmon: monitor a process in the caller's descendant tree.
  *
- *   pidmon_start(pid, 0)                      start a monitoring window
- *   pidmon_read(pid, flags, &usage, size)     aggregate, judge, enforce
+ *   pidmon_start(pid, flags, &limits, size)   open a window and arm its limits
+ *   pidmon_read(pid, flags, &usage, size)     read the window's numbers
  *
  * "pid" is a thread-group id as seen in the caller's pid namespace; 0 means
  * the caller itself.  The target must be the caller or a (grand)child of it,
  * judged by the genealogy at the time of each call.
+ *
+ * The limits are enforced for as long as the window is open, that is between
+ * pidmon_start() and the target's exit or pidmon_read(PIDMON_F_STOP), not
+ * when the window is read.  A soft-limit breach is answered with one warning
+ * signal (SIGXCPU for CPU time, SIGTERM otherwise), a hard-limit breach with
+ * SIGKILL.  The kernel checks about every 10 ms, so a breach is acted on
+ * within that time.  pidmon_read() only reports and never signals.
  */
 
+/* pidmon_start() flags */
+#define PIDMON_F_NO_ENFORCE	(1U << 0)	/* judge and report, never signal */
+#define PIDMON_START_VALID	PIDMON_F_NO_ENFORCE
+
 /* pidmon_read() flags */
-#define PIDMON_F_NO_ENFORCE	(1U << 0)	/* report only, never signal */
 #define PIDMON_F_STOP		(1U << 1)	/* free the monitor after reading */
-#define PIDMON_F_READ_VALID	(PIDMON_F_NO_ENFORCE | PIDMON_F_STOP)
+#define PIDMON_READ_VALID	PIDMON_F_STOP
 
 /* pidmon_usage.state */
-#define PIDMON_ST_EXITED		(1U << 0) /* target is gone; these are its final numbers */
-#define PIDMON_ST_ALREADY_SIGNALLED	(1U << 1) /* this severity was already signalled earlier */
+#define PIDMON_ST_EXITED	(1U << 0)	/* target is gone; these are its final numbers */
 
 /*
  * The limits that are judged, in the order used by pidmon_usage.lim[] and by
@@ -45,18 +54,37 @@ struct pidmon_rlim {
 };
 
 /*
+ * The limits to enforce in a window.  Bit n of "set" means lim[n] is given;
+ * every other limit is the target's own RLIMIT_* of that name, read afresh at
+ * each check.  The soft limit must not exceed the hard limit.  Passing no
+ * struct at all (NULL, size 0) arms every limit from the target's rlimits.
+ * These values belong to the window; the target's real rlimits are untouched.
+ */
+struct pidmon_limits {
+	__u32 set;		/* bitmask of PIDMON_LIM_* given in lim[] */
+	__u32 __pad;
+	struct pidmon_rlim lim[PIDMON_NLIM];
+
+	/* new fields go below this line */
+};
+
+#define PIDMON_LIMITS_SIZE_VER0	120	/* sizeof(struct pidmon_limits) at first release */
+
+/*
  * Counters are reported as the change since pidmon_start() ("window");
  * gauges as the value now, with peaks measured since pidmon_start().
  * Once the target has exited, everything is frozen at its exit
- * (PIDMON_ST_EXITED).
+ * (PIDMON_ST_EXITED).  The exceeded masks and signal_sent cover the whole
+ * window: a limit that was breached stays reported even if the target has
+ * since dropped back under it.
  */
 struct pidmon_usage {
 	/* header */
 	__u32 size;		/* bytes of this struct the kernel filled in */
 	__u32 state;		/* PIDMON_ST_* */
-	__u32 exceeded_soft;	/* bitmask of PIDMON_LIM_* above their soft limit */
-	__u32 exceeded_hard;	/* bitmask of PIDMON_LIM_* above their hard limit */
-	__u32 signal_sent;	/* signal sent by this call, or 0 */
+	__u32 exceeded_soft;	/* bitmask of PIDMON_LIM_* that went above their soft limit */
+	__u32 exceeded_hard;	/* bitmask of PIDMON_LIM_* that went above their hard limit */
+	__u32 signal_sent;	/* strongest signal pidmon sent in this window, or 0 */
 	__u32 __pad;
 
 	/* time */
@@ -95,7 +123,7 @@ struct pidmon_usage {
 	__aligned_u64 nr_threads;
 	__aligned_u64 nr_open_fds;
 
-	/* limits at the time of the call */
+	/* the limits in force: the ones given to pidmon_start(), else the target's rlimits */
 	struct pidmon_rlim lim[PIDMON_NLIM];
 
 	/* new fields go below this line */
