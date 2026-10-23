@@ -46,7 +46,7 @@ int main(void)
 	EXPECT_ERR("start", pm_start(c, 0), 0);
 	put_byte(to, 'g');
 	CHECK(get_byte(from, 10000) == 'd', "worker did not finish");
-	EXPECT_ERR("read", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 
 	/* a little slack for the handshake pipe bytes, none for the big transfers */
 	CHECK(u.rchar >= 256 * KB && u.rchar < 256 * KB + 4 * KB, "rchar=%llu want ~256 KB",
@@ -61,7 +61,7 @@ int main(void)
 		struct pidmon_usage v;
 
 		msleep(100);
-		EXPECT_ERR("read again", pm_read(c, PIDMON_F_NO_ENFORCE, &v), 0);
+		EXPECT_ERR("read again", pm_read(c, 0, &v), 0);
 		CHECK(v.rchar == u.rchar && v.wchar == u.wchar, "counters moved while idle");
 	}
 

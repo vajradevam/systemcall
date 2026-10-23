@@ -40,7 +40,7 @@ int main(void)
 	c = spawn(worker, &to, &from);
 	CHECK(get_byte(from, 10000) == 'r', "worker not ready");
 	EXPECT_ERR("start", pm_start(c, 0), 0);
-	EXPECT_ERR("read base", pm_read(c, PIDMON_F_NO_ENFORCE, &u0), 0);
+	EXPECT_ERR("read base", pm_read(c, 0, &u0), 0);
 	CHECK(u0.stack_vm > 0, "stack_vm=%llu", (unsigned long long)u0.stack_vm);
 	CHECK(u0.rss_bytes == u0.rss_anon + u0.rss_file ||
 	      u0.rss_bytes >= u0.rss_anon + u0.rss_file, "rss split: %llu = %llu + %llu",
@@ -49,7 +49,7 @@ int main(void)
 
 	put_byte(to, 'g');
 	CHECK(get_byte(from, 10000) == '1', "step 1");
-	EXPECT_ERR("read 24 MB", pm_read(c, PIDMON_F_NO_ENFORCE, &u1), 0);
+	EXPECT_ERR("read 24 MB", pm_read(c, 0, &u1), 0);
 	CHECK(u1.vm_bytes >= u0.vm_bytes + 24 * MB, "vm_bytes %llu -> %llu",
 	      (unsigned long long)u0.vm_bytes, (unsigned long long)u1.vm_bytes);
 	CHECK(u1.data_vm >= u0.data_vm + 24 * MB, "data_vm %llu -> %llu",
@@ -61,7 +61,7 @@ int main(void)
 
 	put_byte(to, 'g');
 	CHECK(get_byte(from, 10000) == '2', "step 2");
-	EXPECT_ERR("read mlock", pm_read(c, PIDMON_F_NO_ENFORCE, &u2), 0);
+	EXPECT_ERR("read mlock", pm_read(c, 0, &u2), 0);
 	CHECK(u2.locked_vm >= u1.locked_vm + 8 * MB, "locked_vm %llu -> %llu",
 	      (unsigned long long)u1.locked_vm, (unsigned long long)u2.locked_vm);
 	CHECK(u2.vm_bytes >= u1.vm_bytes + 8 * MB, "vm_bytes %llu -> %llu",
@@ -71,7 +71,7 @@ int main(void)
 
 	put_byte(to, 'g');
 	CHECK(get_byte(from, 10000) == '3', "step 3");
-	EXPECT_ERR("read freed", pm_read(c, PIDMON_F_NO_ENFORCE, &u3), 0);
+	EXPECT_ERR("read freed", pm_read(c, 0, &u3), 0);
 	CHECK(u3.vm_bytes + 30 * MB <= u2.vm_bytes, "vm_bytes did not drop: %llu -> %llu",
 	      (unsigned long long)u2.vm_bytes, (unsigned long long)u3.vm_bytes);
 	CHECK(u3.rss_bytes + 30 * MB <= u2.rss_bytes, "rss_bytes did not drop: %llu -> %llu",

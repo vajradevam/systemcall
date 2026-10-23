@@ -50,14 +50,14 @@ int main(void)
 	t0 = cpu_ns(CLOCK_MONOTONIC);
 	EXPECT_ERR("start", pm_start(c, 0), 0);
 	msleep(400);
-	EXPECT_ERR("read", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	t1 = cpu_ns(CLOCK_MONOTONIC);
 	CHECK(u.cpu_permille < 50, "sleeper cpu_permille=%llu", (unsigned long long)u.cpu_permille);
 	CHECK(u.wall_ns >= 400000000ULL && u.wall_ns <= t1 - t0,
 	      "wall_ns=%llu, caller measured %llu", (unsigned long long)u.wall_ns,
 	      (unsigned long long)(t1 - t0));
 	msleep(100);
-	EXPECT_ERR("read later", pm_read(c, PIDMON_F_NO_ENFORCE, &v), 0);
+	EXPECT_ERR("read later", pm_read(c, 0, &v), 0);
 	CHECK(v.wall_ns >= u.wall_ns + 90000000ULL, "wall_ns advanced %llu -> %llu",
 	      (unsigned long long)u.wall_ns, (unsigned long long)v.wall_ns);
 	kill_reap(c);
@@ -67,7 +67,7 @@ int main(void)
 	CHECK(get_byte(from, 10000) == 'r', "not ready");
 	EXPECT_ERR("start", pm_start(c, 0), 0);
 	CHECK(get_byte(from, 10000) == 'd', "did not finish");
-	EXPECT_ERR("read", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	CHECK(u.cpu_permille >= 850 && u.cpu_permille <= 1100, "one thread: cpu_permille=%llu",
 	      (unsigned long long)u.cpu_permille);
 	kill_reap(c);
@@ -78,7 +78,7 @@ int main(void)
 		CHECK(get_byte(from, 10000) == 'r', "not ready");
 		EXPECT_ERR("start", pm_start(c, 0), 0);
 		CHECK(get_byte(from, 10000) == 'd', "did not finish");
-		EXPECT_ERR("read", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+		EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 		CHECK(u.cpu_permille >= 1500 && u.cpu_permille <= 2200,
 		      "two threads: cpu_permille=%llu", (unsigned long long)u.cpu_permille);
 		kill_reap(c);

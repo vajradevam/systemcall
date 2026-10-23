@@ -54,7 +54,7 @@ int main(void)
 	get_byte(fd, 2000);
 	close(fd);
 	EXPECT_ERR("start fresh", pm_start(c, 0), 0);
-	EXPECT_ERR("read fresh", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("read fresh", pm_read(c, 0, &u), 0);
 	CHECK(u.state == 0 && u.signal_sent == 0, "state=%x sig=%u", u.state, u.signal_sent);
 	kill_reap(c);
 

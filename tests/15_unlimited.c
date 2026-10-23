@@ -86,7 +86,7 @@ int main(void)
 	c = spawn(exact, &to, &from);
 	CHECK(get_byte(from, 10000) == 'r', "child not ready");
 	EXPECT_ERR("start", pm_start(c, 0), 0);
-	EXPECT_ERR("read", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	for (i = 0; i < PIDMON_NLIM; i++) {
 		if (prlimit(c, rl_of[i], NULL, &rl))
 			die("prlimit");

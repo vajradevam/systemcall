@@ -49,12 +49,12 @@ static void rearm(void)
 	EXPECT_ERR("start 1", pm_start(c, 0), 0);
 	put_byte(to, 'g');
 	CHECK(get_byte(from, 10000) == 'd', "burn 1");
-	EXPECT_ERR("read 1 STOP", pm_read(c, PIDMON_F_STOP | PIDMON_F_NO_ENFORCE, &a), 0);
+	EXPECT_ERR("read 1 STOP", pm_read(c, PIDMON_F_STOP, &a), 0);
 	CHECK(a.utime_ns + a.stime_ns >= 80000000ULL, "window 1 cpu=%llu",
 	      (unsigned long long)(a.utime_ns + a.stime_ns));
 
 	EXPECT_ERR("start 2", pm_start(c, 0), 0);
-	EXPECT_ERR("read 2 right away", pm_read(c, PIDMON_F_NO_ENFORCE, &b), 0);
+	EXPECT_ERR("read 2 right away", pm_read(c, 0, &b), 0);
 	CHECK(b.utime_ns + b.stime_ns < (a.utime_ns + a.stime_ns) / 2,
 	      "window 2 starts from zero: cpu=%llu (window 1 had %llu)",
 	      (unsigned long long)(b.utime_ns + b.stime_ns),
@@ -79,10 +79,10 @@ static void zombie(void)
 	EXPECT_ERR("start", pm_start(c, 0), 0);
 	put_byte(to, 'g');
 	CHECK(waitid(P_PID, c, &si, WEXITED | WNOWAIT) == 0, "waitid");
-	EXPECT_ERR("read zombie", pm_read(c, PIDMON_F_NO_ENFORCE, &a), 0);
+	EXPECT_ERR("read zombie", pm_read(c, 0, &a), 0);
 	CHECK(a.state & PIDMON_ST_EXITED, "state=%x", a.state);
 	EXPECT_ERR("start zombie again", pm_start(c, 0), 0);
-	EXPECT_ERR("read zombie 2", pm_read(c, PIDMON_F_NO_ENFORCE, &z), 0);
+	EXPECT_ERR("read zombie 2", pm_read(c, 0, &z), 0);
 	CHECK(z.state & PIDMON_ST_EXITED, "state=%x", z.state);
 	CHECK(z.signal_sent == 0, "signalled a zombie: %u", z.signal_sent);
 	/* the exit hook freezes the numbers just before the last thread finishes dying */
@@ -108,7 +108,7 @@ static void slots(void)
 	for (i = 0; i < PIDMON_MAX_RECS_FOR_TEST; i++)
 		EXPECT_ERR("fill", pm_start(kids[i], 0), 0);
 	EXPECT_ERR("full", pm_start(kids[PIDMON_MAX_RECS_FOR_TEST], 0), ENOSPC);
-	EXPECT_ERR("free one", pm_read(kids[10], PIDMON_F_STOP | PIDMON_F_NO_ENFORCE, &a), 0);
+	EXPECT_ERR("free one", pm_read(kids[10], PIDMON_F_STOP, &a), 0);
 	EXPECT_ERR("room again", pm_start(kids[PIDMON_MAX_RECS_FOR_TEST], 0), 0);
 	EXPECT_ERR("full again", pm_start(kids[10], 0), ENOSPC);
 	/* a record whose target died still counts until it is read out or its owner exits */
