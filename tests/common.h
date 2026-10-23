@@ -47,9 +47,23 @@ static const char *test_name = "?";
 } while (0)
 
 /* return value of the syscall: 0 on success, otherwise the (positive) errno */
+UNUSED int pm_start_lim(pid_t pid, unsigned int flags, const struct pidmon_limits *lim)
+{
+	return syscall(__NR_pidmon_start, pid, flags, lim, lim ? sizeof(*lim) : 0) < 0 ? errno : 0;
+}
+
+/* start with the target's own rlimits */
 UNUSED int pm_start(pid_t pid, unsigned int flags)
 {
-	return syscall(__NR_pidmon_start, pid, flags) < 0 ? errno : 0;
+	return pm_start_lim(pid, flags, NULL);
+}
+
+/* fill lim so that only limit n is given, with these values */
+UNUSED void lim_set(struct pidmon_limits *lim, int n, uint64_t soft, uint64_t hard)
+{
+	lim->set |= 1U << n;
+	lim->lim[n].soft = soft;
+	lim->lim[n].hard = hard;
 }
 
 UNUSED int pm_read(pid_t pid, unsigned int flags, struct pidmon_usage *u)
