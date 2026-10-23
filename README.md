@@ -166,6 +166,7 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 | `53_equal_limits` | soft equal to hard kills at once and reports both severities |
 | `54_live_rlimit` | an unset limit is the target's own rlimit, re-read as it changes |
 | `55_escalation` | warn then kill, several limits at once, hard beats soft |
+| `56_ignored_warning` | a handled warning is sent once; the target survives and signal_sent says so |
 | `58_sampler` | breach latency, independent windows with different limits, no enforcement after the owner exits or for an orphan |
 | `60_exit` | a zombie, a reaped child and a killed child keep their numbers; an owner exiting with monitors |
 | `65_scope` | threads share records; fork, exec and descendants do not |
