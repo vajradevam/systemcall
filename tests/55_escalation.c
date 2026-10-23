@@ -1,5 +1,6 @@
-/* Enforcement across limits and severities: a warned target that then crosses its hard limit is
- * still killed, several exceeded limits are all reported, and hard beats soft in one call. */
+/* Enforcement across limits and severities, done by the window with no read in between: a warned
+ * target that then crosses its hard limit is still killed, several exceeded limits are all
+ * reported, and hard beats soft. */
 #include "common.h"
 
 #define MB (1024UL * 1024)
@@ -93,46 +94,50 @@ int main(void)
 	c = spawn(escalating, &to, &from);
 	CHECK(get_byte(from, 10000) == 'r', "child not ready");
 	EXPECT_ERR("start", pm_start(c, 0), 0);
-	EXPECT_ERR("read soft", pm_read(c, 0, &u), 0);
-	CHECK(u.signal_sent == SIGTERM, "signal_sent=%u", u.signal_sent);
-	CHECK(u.exceeded_hard == 0, "exceeded_hard=%x", u.exceeded_hard);
 	CHECK(get_byte(from, 3000) == 'T', "warning not delivered");
 	put_byte(to, 'g');
-	CHECK(get_byte(from, 10000) == 'g', "child did not grow");
-	EXPECT_ERR("read hard", pm_read(c, 0, &u), 0);
-	CHECK(u.exceeded_hard == (1U << PIDMON_LIM_RSS), "exceeded_hard=%x", u.exceeded_hard);
-	CHECK(u.signal_sent == SIGKILL, "a warned target must still be killed: signal_sent=%u",
-	      u.signal_sent);
-	CHECK(!(u.state & PIDMON_ST_ALREADY_SIGNALLED), "state=%x", u.state);
 	waitpid(c, &st, 0);
-	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "child status %x", st);
+	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL,
+	      "a warned target must still be killed at its hard limit: status %x", st);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
+	CHECK(u.state & PIDMON_ST_EXITED, "state=%x", u.state);
+	CHECK(u.exceeded_hard == (1U << PIDMON_LIM_RSS), "exceeded_hard=%x", u.exceeded_hard);
+	CHECK(u.exceeded_soft == (1U << PIDMON_LIM_RSS), "exceeded_soft=%x", u.exceeded_soft);
+	CHECK(u.signal_sent == SIGKILL, "the strongest signal is reported: %u", u.signal_sent);
 
-	/* --- several soft limits in one read: one warning, every bit set --- */
+	/* --- several soft limits at once: one warning, every bit set --- */
 	c = spawn(many_soft, &to, &from);
 	CHECK(get_byte(from, 10000) == 'r', "child not ready");
 	EXPECT_ERR("start", pm_start(c, 0), 0);
+	CHECK(get_byte(from, 3000) == 'T', "warning not delivered");
+	CHECK(get_byte(from, 500) == -1, "more than one warning for three limits");
 	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	CHECK(u.exceeded_soft == ((1U << PIDMON_LIM_RSS) | (1U << PIDMON_LIM_DATA) |
 				  (1U << PIDMON_LIM_NOFILE)), "exceeded_soft=%x", u.exceeded_soft);
 	CHECK(u.exceeded_hard == 0, "exceeded_hard=%x", u.exceeded_hard);
 	CHECK(u.signal_sent == SIGTERM, "signal_sent=%u", u.signal_sent);
-	CHECK(get_byte(from, 3000) == 'T', "warning not delivered");
-	CHECK(get_byte(from, 300) == -1, "more than one warning for three limits");
 	kill_reap(c);
 
-	/* --- a hard breach wins over a soft one, and NO_ENFORCE leaves it alive --- */
+	/* --- a hard breach wins over a soft one; a report-only window leaves it alive --- */
 	c = spawn(mixed, &to, &from);
 	CHECK(get_byte(from, 10000) == 'r', "child not ready");
-	EXPECT_ERR("start", pm_start(c, 0), 0);
-	EXPECT_ERR("read NO_ENFORCE", pm_read(c, PIDMON_F_NO_ENFORCE, &u), 0);
+	EXPECT_ERR("start NO_ENFORCE", pm_start(c, PIDMON_F_NO_ENFORCE), 0);
+	msleep(300);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	CHECK(u.exceeded_hard == (1U << PIDMON_LIM_RSS), "exceeded_hard=%x", u.exceeded_hard);
 	CHECK(u.exceeded_soft == ((1U << PIDMON_LIM_RSS) | (1U << PIDMON_LIM_NOFILE)),
 	      "exceeded_soft=%x", u.exceeded_soft);
 	CHECK(u.signal_sent == 0 && kill(c, 0) == 0, "NO_ENFORCE must not kill");
-	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
-	CHECK(u.signal_sent == SIGKILL, "signal_sent=%u: hard beats soft", u.signal_sent);
+	EXPECT_ERR("read STOP", pm_read(c, PIDMON_F_STOP, &u), 0);
+	kill_reap(c);
+
+	c = spawn(mixed, &to, &from);
+	CHECK(get_byte(from, 10000) == 'r', "child not ready");
+	EXPECT_ERR("start", pm_start(c, 0), 0);
 	waitpid(c, &st, 0);
-	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "child status %x", st);
+	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "hard beats soft: status %x", st);
+	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
+	CHECK(u.signal_sent == SIGKILL, "signal_sent=%u", u.signal_sent);
 
 	return test_end();
 }
