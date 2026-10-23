@@ -1,5 +1,6 @@
-/* A monitor can be re-armed: STOP then start opens a fresh window, a target that died can be
- * monitored again while it is still a zombie, and a full owner can free room and go on. */
+/* A monitor can be re-armed: STOP then start opens a fresh window, a zombie keeps its numbers but
+ * cannot be monitored again (and leaves no unreachable record behind), and a full owner can free
+ * room and go on. */
 #include "common.h"
 
 static void burner(int in, int out)
@@ -66,7 +67,26 @@ static void rearm(void)
 	kill_reap(c);
 }
 
-/* a zombie that is not reaped can be armed again and still reads as exited */
+/* start n sleepers, each with a window, and clean up; every start must succeed */
+static void fill_slots(int n)
+{
+	struct pidmon_usage u;
+	pid_t k[PIDMON_MAX_RECS_FOR_TEST];
+	int i, fd;
+
+	for (i = 0; i < n; i++) {
+		k[i] = spawn(sleeper, NULL, &fd);
+		get_byte(fd, 2000);
+		close(fd);
+		EXPECT_ERR("slot", pm_start(k[i], 0), 0);
+	}
+	for (i = 0; i < n; i++) {
+		pm_read(k[i], PIDMON_F_STOP, &u);
+		kill_reap(k[i]);
+	}
+}
+
+/* a zombie that is not reaped keeps its numbers, but no window can be opened on it again */
 static void zombie(void)
 {
 	struct pidmon_usage a, z;
@@ -81,16 +101,18 @@ static void zombie(void)
 	CHECK(waitid(P_PID, c, &si, WEXITED | WNOWAIT) == 0, "waitid");
 	EXPECT_ERR("read zombie", pm_read(c, 0, &a), 0);
 	CHECK(a.state & PIDMON_ST_EXITED, "state=%x", a.state);
-	EXPECT_ERR("start zombie again", pm_start(c, 0), 0);
+	/* a window cannot be opened on a process that has finished exiting, and nothing is left behind */
+	EXPECT_ERR("start zombie again", pm_start(c, 0), ESRCH);
 	EXPECT_ERR("read zombie 2", pm_read(c, 0, &z), 0);
 	CHECK(z.state & PIDMON_ST_EXITED, "state=%x", z.state);
 	CHECK(z.signal_sent == 0, "signalled a zombie: %u", z.signal_sent);
-	/* the exit hook freezes the numbers just before the last thread finishes dying */
-	CHECK(z.cpu_total_ns >= a.cpu_total_ns && z.cpu_total_ns < a.cpu_total_ns + 1000000ULL,
-	      "zombie cpu_total moved: %llu vs %llu", (unsigned long long)z.cpu_total_ns,
-	      (unsigned long long)a.cpu_total_ns);
+	CHECK(z.cpu_total_ns == a.cpu_total_ns, "the frozen numbers changed: %llu vs %llu",
+	      (unsigned long long)z.cpu_total_ns, (unsigned long long)a.cpu_total_ns);
 	waitpid(c, NULL, 0);
 	EXPECT_ERR("start reaped", pm_start(c, 0), ESRCH);
+	EXPECT_ERR("read STOP", pm_read(c, PIDMON_F_STOP, &a), 0);
+	EXPECT_ERR("read after STOP", pm_read(c, 0, &a), ENOENT);
+	fill_slots(PIDMON_MAX_RECS_FOR_TEST);	/* all 64 slots are still available */
 }
 
 /* fill the owner, free one slot, start one more */

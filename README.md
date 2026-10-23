@@ -33,7 +33,7 @@ and its child is reparented (to init or a subreaper), the old ancestor loses acc
 
 | Call | Errors |
 |---|---|
-| `pidmon_start` | `EINVAL` bad flags, pid, size or limits (unknown limit bit, soft above hard, size without a struct), `E2BIG` size too big or unknown non-zero tail, `EFAULT` bad pointer, `ESRCH` no such process, `EPERM` not self or a descendant, `EBUSY` already monitored, `ENOSPC` 64 monitors already held, `ENOMEM`, `EINTR` |
+| `pidmon_start` | `EINVAL` bad flags, pid, size or limits (unknown limit bit, soft above hard, size without a struct), `E2BIG` size too big or unknown non-zero tail, `EFAULT` bad pointer, `ESRCH` no such process, or one that has finished exiting (a zombie), `EPERM` not self or a descendant, `EBUSY` already monitored, `ENOSPC` 64 monitors already held, `ENOMEM`, `EINTR` |
 | `pidmon_read` | `EINVAL`/`E2BIG` bad flags, pid or size, `ENOENT` no monitor for that pid, `ESRCH` target gone and nothing was kept, `EPERM` target left the caller's tree, `EFAULT` bad pointer |
 
 ## Limits
@@ -66,6 +66,7 @@ Enforcement runs for as long as the window is open: from `pidmon_start` until th
 - Over a **hard** limit: `SIGKILL`. A target that was warned and later crosses its hard limit is still killed.
 - Each severity is sent once per window.
 - A target that is already over a limit when the window opens is acted on at the first check.
+- A window cannot be opened on a process that has already finished exiting, even if it is still an unreaped zombie (`ESRCH`); the window that was open when it exited stays readable.
 - A window started with `PIDMON_F_NO_ENFORCE` records the breaches but sends nothing.
 - Signals are sent without a uid or `CAP_KILL` check: being the ancestor is the authorization.
 - The check runs about every 10 ms (`PIDMON_POLL_MS`), so a breach is acted on within roughly that time.
@@ -165,7 +166,7 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 | `58_sampler` | breach latency, independent windows with different limits, no enforcement after the owner exits or for an orphan |
 | `60_exit` | a zombie, a reaped child and a killed child keep their numbers; an owner exiting with monitors |
 | `65_scope` | threads share records; fork, exec and descendants do not |
-| `68_restart` | re-arming after `STOP`, a zombie that is not reaped, slot reuse at the cap |
+| `68_restart` | re-arming after `STOP`, a zombie keeps its numbers and refuses a new window, no slot is lost, slot reuse at the cap |
 | `70_threads` | CPU summed over threads, memory counted once, a group whose main thread already exited |
 | `75_owner_exit` | an exiting owner frees all its records, repeated against the cap |
 | `80_ns` | pid namespaces: numbers are resolved in the caller's namespace |
