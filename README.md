@@ -6,6 +6,8 @@ is open the kernel watches the descendant and warns or kills it if it goes over 
 call reads how much CPU, memory and I/O the descendant used. Any pid outside the caller's own
 subtree is refused.
 
+Full usage reference: [docs/pidmon.md](docs/pidmon.md).
+
 - Kernel base: mainline Linux 7.3.0-rc7, commit `0fcb05b72` (pinned in `BASE_COMMIT`)
 - `pidmon_start` is syscall **473** and `pidmon_read` is **474** (x86-64 and i386; 472 was already taken by `fchroot`)
 
