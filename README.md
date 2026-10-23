@@ -177,7 +177,7 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 ### Where it has been run
 
 The current design (limits at `start`, enforcement in the window) has been built and tested in the
-QEMU VM only, on both the `tiny` and `debug` kernels, and the demo has been run there. The KASAN and
+QEMU VM only, as root, on both the `tiny` and `debug` kernels, and the demo has been run there. The KASAN and
 lockdep checks cover only the QEMU `debug` kernel. It has not yet been run on a real machine.
 Some tests assume the busybox VM (for example, orphans being adopted by pid 1) and would need changes
 to run on a systemd machine. Tests `30_usage`, `40_window` and `60_exit` count minor page faults and fail
@@ -185,12 +185,29 @@ when transparent hugepages are set to `always`; use `madvise` or `never`.
 
 ## Demo
 
-`demo/pidmon_demo.c` walks through the features and prints the results: monitoring yourself, the
-ancestry rule, an orphaned grandchild, a full usage report, soft and hard limit enforcement without any
-read, a report-only window, and reading a child that already exited.
+`demo/pidmon_demo.c` is a guided tour of the whole interface in 15 scenarios, each printing what it
+asks and how the kernel answers:
+
+| # | Scenario |
+|---|---|
+| 1 | monitoring yourself |
+| 2 | who may be monitored: child and grandchild yes; parent, init, nonexistent no; an orphan loses access, unless you are a subreaper |
+| 3 | a full report: every field of `struct pidmon_usage`, with CPU burnt before the window left out of the counters |
+| 4 | memory: gauges follow `mmap`, `mlock` and `munmap`; peaks stay |
+| 5 | limits: the target's own by default, or the ones given in the struct, with the target's real rlimits untouched |
+| 6 | enforcement with no read: one warning at the soft limit, a kill at the hard limit |
+| 7 | all seven limits, one child each, with the signal each gets and how fast |
+| 8 | report-only windows (`PIDMON_F_NO_ENFORCE`) |
+| 9 | a breach is remembered after the target recovers |
+| 10 | enforcement exists only inside the window |
+| 11 | a child that exited, even as an unreaped zombie, keeps its numbers; no new window on it |
+| 12 | threads: CPU is summed, a thread id is not a valid target |
+| 13 | monitors belong to their owner; a forked child starts with none |
+| 14 | the cap of 64 monitors |
+| 15 | every error the two calls can return |
 
 ```bash
-gcc -O1 -Wall -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_demo.c
+gcc -O1 -Wall -pthread -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_demo.c
 ./pidmon_demo
 ```
 
@@ -198,6 +215,7 @@ gcc -O1 -Wall -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_
 - `demo/install-kernel.sh` installs a kernel built in `~/pidmon/build-ubuntu` on an Ubuntu machine
   (modules, `/boot`, initramfs, `update-grub`). It needs sudo and does not reboot.
 - The headers come from `make headers_install`. Without them a program can use the raw numbers 473 and 474.
+- Scenario 7 needs a system that allows `mlock` of 4 MB; if not, that row says the action was refused.
 
 ## Notes
 
