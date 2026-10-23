@@ -173,6 +173,7 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 | `65_scope` | threads share records; fork, exec and descendants do not |
 | `68_restart` | re-arming after `STOP`, a zombie keeps its numbers and refuses a new window, no slot is lost, slot reuse at the cap |
 | `70_threads` | CPU summed over threads, memory counted once, a group whose main thread already exited |
+| `72_ctxsw` | voluntary context switches are counted in the window |
 | `75_owner_exit` | an exiting owner frees all its records, repeated against the cap |
 | `80_ns` | pid namespaces: numbers are resolved in the caller's namespace |
 | `85_rate` | `cpu_permille` for idle, one and two busy threads; `wall_ns` against the clock |
