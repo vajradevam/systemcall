@@ -183,11 +183,14 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 ### Where it has been run
 
 The current design (limits at `start`, enforcement in the window) has been built and tested in the
-QEMU VM only, as root, on both the `tiny` and `debug` kernels, and the demo has been run there. The KASAN and
-lockdep checks cover only the QEMU `debug` kernel. It has not yet been run on a real machine.
-Some tests assume the busybox VM (for example, orphans being adopted by pid 1) and would need changes
-to run on a systemd machine. Tests `30_usage`, `40_window` and `60_exit` count minor page faults and fail
-when transparent hugepages are set to `always`; use `madvise` or `never`.
+QEMU VM as root, on both the `tiny` and `debug` kernels, and the demo has been run there. The KASAN and
+lockdep checks cover only the QEMU `debug` kernel.
+
+It has also been run natively on an Arch Linux machine (systemd, 8 CPUs, kernel built on the machine
+and booted from a unified kernel image). All 26 test programs pass as root, and the demo runs to the
+end both as root and as an unprivileged user. The three tests that count minor page faults (`30_usage`,
+`40_window` and `60_exit`) fail when transparent hugepages are set to `always`; with `madvise` or
+`never` they pass. It has not been run on Ubuntu.
 
 ## Demo
 
