@@ -169,6 +169,7 @@ Each test forks its own process tree, so a kill cannot hit the runner. All 19 pa
 | `56_ignored_warning` | a handled warning is sent once; the target survives and signal_sent says so |
 | `58_sampler` | breach latency, independent windows with different limits, no enforcement after the owner exits or for an orphan |
 | `60_exit` | a zombie, a reaped child and a killed child keep their numbers; an owner exiting with monitors |
+| `62_new_window_clean` | a new window starts with empty exceeded masks and signal_sent |
 | `65_scope` | threads share records; fork, exec and descendants do not |
 | `68_restart` | re-arming after `STOP`, a zombie keeps its numbers and refuses a new window, no slot is lost, slot reuse at the cap |
 | `70_threads` | CPU summed over threads, memory counted once, a group whose main thread already exited |
