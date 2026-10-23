@@ -1,79 +1,120 @@
 # monitor and limit your own child processes (CS-G623)
 
-`pidmon` adds two system calls to Linux. A process can ask the kernel how much CPU, memory and
-I/O one of its **descendants** (child, grandchild, ...) has used, and the kernel enforces that
-descendant's resource limits when asked. Any pid outside the caller's own subtree is refused.
+`pidmon` adds two system calls to Linux. A process opens a **window** on one of its descendants
+(child, grandchild, ...) and hands the kernel the resource limits for that window. While the window
+is open the kernel watches the descendant and warns or kills it if it goes over a limit. The second
+call reads how much CPU, memory and I/O the descendant used. Any pid outside the caller's own
+subtree is refused.
 
 - Kernel base: mainline Linux 7.3.0-rc7, commit `0fcb05b72` (pinned in `BASE_COMMIT`)
 - `pidmon_start` is syscall **473** and `pidmon_read` is **474** (x86-64 and i386; 472 was already taken by `fchroot`)
 
-## How it works
+## The two calls
 
 ```c
-long pidmon_start(pid_t pid, unsigned int flags);                    /* 473 */
+long pidmon_start(pid_t pid, unsigned int flags,
+                  const struct pidmon_limits __user *limits, size_t size);   /* 473 */
 long pidmon_read (pid_t pid, unsigned int flags,
-                  struct pidmon_usage __user *uattr, size_t usize);  /* 474 */
+                  struct pidmon_usage __user *usage, size_t size);           /* 474 */
 ```
 
-1. `pidmon_start(pid, 0)` opens a monitoring window on `pid` (`0` means the caller itself).
-2. The target runs. Later, `pidmon_read(pid, flags, &usage, sizeof(usage))` returns what it used
-   during the window, compares that with the target's `rlimit`s, and signals it if a limit is exceeded.
+`pid` is a thread-group id in the caller's pid namespace; `0` means the caller itself. The target must
+be the caller or a descendant, judged from the **current** parent chain at every call. If a parent dies
+and its child is reparented (to init or a subreaper), the old ancestor loses access.
 
-`pid` is a thread-group id in the caller's pid namespace. The target must be the caller or a
-descendant, judged from the **current** parent chain at every call. If a parent dies and its child is
-reparented (to init or a subreaper), the old ancestor loses access.
+| | `pidmon_start` | `pidmon_read` |
+|---|---|---|
+| Job | open the window, remember the counters, arm the limits | report the window; **never signals** |
+| Flags | `PIDMON_F_NO_ENFORCE`: judge and report, never signal | `PIDMON_F_STOP`: close the window after reading |
+| Struct | `struct pidmon_limits`, 120 bytes, or `NULL` with size 0 | `struct pidmon_usage`, at least 328 bytes, at most one page |
 
-**Flags for `pidmon_read`:** `PIDMON_F_NO_ENFORCE` reports without signalling; `PIDMON_F_STOP` releases the
-monitor after reading. `usize` lets the struct grow later, like `clone3`: at least 328 bytes, at most one page.
+`size` lets both structs grow later, like `clone3`: a longer struct is accepted if the extra tail is zero
+(`E2BIG` otherwise), and a longer buffer on `read` gets a zeroed tail.
 
 | Call | Errors |
 |---|---|
-| `pidmon_start` | `EINVAL` bad flags or pid, `ESRCH` no such process, `EPERM` not self or a descendant, `EBUSY` already monitored, `ENOSPC` 64 monitors already held, `ENOMEM`, `EINTR` |
+| `pidmon_start` | `EINVAL` bad flags, pid, size or limits (unknown limit bit, soft above hard, size without a struct), `E2BIG` size too big or unknown non-zero tail, `EFAULT` bad pointer, `ESRCH` no such process, `EPERM` not self or a descendant, `EBUSY` already monitored, `ENOSPC` 64 monitors already held, `ENOMEM`, `EINTR` |
 | `pidmon_read` | `EINVAL`/`E2BIG` bad flags, pid or size, `ENOENT` no monitor for that pid, `ESRCH` target gone and nothing was kept, `EPERM` target left the caller's tree, `EFAULT` bad pointer |
 
-### What `pidmon_read` returns
+## Limits
+
+`struct pidmon_limits` carries a `set` bitmask and a soft/hard pair for each of seven limits. Each is
+compared with a usage number in the unit of the rlimit of the same name:
+
+| Index | Limit | Compared with |
+|---|---|---|
+| `PIDMON_LIM_CPU` | `RLIMIT_CPU` | total CPU seconds since the process began |
+| `PIDMON_LIM_AS` | `RLIMIT_AS` | virtual size |
+| `PIDMON_LIM_RSS` | `RLIMIT_RSS` | resident size |
+| `PIDMON_LIM_DATA` | `RLIMIT_DATA` | private writable mappings |
+| `PIDMON_LIM_STACK` | `RLIMIT_STACK` | main-thread stack mapping |
+| `PIDMON_LIM_MEMLOCK` | `RLIMIT_MEMLOCK` | `mlock`ed memory |
+| `PIDMON_LIM_NOFILE` | `RLIMIT_NOFILE` | open file descriptors |
+
+- Bit *n* of `set` means `lim[n]` is given. Any limit not given is the target's own `RLIMIT_*` of that
+  name, read afresh at each check. With no struct at all, every limit comes from the target's rlimits.
+- `~0` means unlimited. The soft value must not exceed the hard value.
+- The limits belong to the window. The target's real rlimits are never changed, so no privilege is
+  needed to give a limit above the target's own hard limit.
+
+## Enforcement
+
+Enforcement runs for as long as the window is open: from `pidmon_start` until the target exits or
+`pidmon_read` with `PIDMON_F_STOP`. Nobody has to call `pidmon_read`.
+
+- Over a **soft** limit: one warning, `SIGXCPU` for CPU and `SIGTERM` for the rest.
+- Over a **hard** limit: `SIGKILL`. A target that was warned and later crosses its hard limit is still killed.
+- Each severity is sent once per window.
+- A target that is already over a limit when the window opens is acted on at the first check.
+- A window started with `PIDMON_F_NO_ENFORCE` records the breaches but sends nothing.
+- Signals are sent without a uid or `CAP_KILL` check: being the ancestor is the authorization.
+- The check runs about every 10 ms (`PIDMON_POLL_MS`), so a breach is acted on within roughly that time.
+- Enforcement stops for a target that left the owner's tree, and for all of an owner's windows when the owner exits.
+- The kernel itself enforces `RLIMIT_CPU` and `RLIMIT_AS` on a target that has them set; `RLIMIT_RSS` it never enforces.
+
+## What `pidmon_read` returns
 
 `struct pidmon_usage` (328 bytes, in `include/uapi/linux/pidmon.h`). Counters are the change since
 `pidmon_start`, sizes are the value now, and peaks are measured since `pidmon_start`.
 
 | Group | Fields |
 |---|---|
-| header | `size`, `state` (`EXITED`, `ALREADY_SIGNALLED`), `exceeded_soft`, `exceeded_hard`, `signal_sent` |
+| header | `size`, `state` (`EXITED`), `exceeded_soft`, `exceeded_hard`, `signal_sent` |
 | time | `wall_ns` (length of the window) |
 | CPU | `utime_ns`, `stime_ns`, `cpu_total_ns` (since the process began), `cpu_permille` (1000 = one CPU fully busy), `vol_ctxsw`, `invol_ctxsw` |
 | page faults | `minor_faults`, `major_faults` |
 | I/O | `rchar`, `wchar`, `read_bytes`, `write_bytes` |
 | memory (bytes) | `rss_bytes`, `rss_anon`, `rss_file`, `rss_peak`, `vm_bytes`, `vm_peak`, `data_vm`, `stack_vm`, `locked_vm` |
 | process | `nr_threads`, `nr_open_fds` |
-| limits | soft and hard value of CPU, AS, RSS, DATA, STACK, MEMLOCK, NOFILE |
+| limits | soft and hard value of each limit in force, in `PIDMON_LIM_*` order |
 
-### Enforcement
+`exceeded_soft` and `exceeded_hard` are bitmasks of `PIDMON_LIM_*`, and `signal_sent` is the strongest
+signal sent. All three cover the **whole window**: a limit that was breached stays reported after the
+target has dropped back under it. `state` has `PIDMON_ST_EXITED` once the target is gone and the numbers are final.
 
-The target's own rlimits are the limits. These seven are compared with a matching usage number
-(the other rlimits have none): CPU with total CPU seconds, AS with virtual size, RSS with resident size,
-DATA, STACK (main-thread stack), MEMLOCK, and NOFILE with open descriptors.
+## Design notes
 
-- Over a **soft** limit: `SIGXCPU` for CPU, `SIGTERM` for the rest.
-- Over a **hard** limit: `SIGKILL`.
-- Each severity is sent once per monitor; a later read still reports the violation but sets `ALREADY_SIGNALLED`.
-- Enforcement happens when `pidmon_read` is called, not in the background.
-- Signals are sent without a uid or `CAP_KILL` check: being the ancestor is the authorization.
-- The kernel already enforces `RLIMIT_CPU` and `RLIMIT_AS` itself; `RLIMIT_RSS` it never enforces, so `pidmon_read` is where that one bites.
-
-### Design notes
-
-- **No timer.** `start` remembers the counters and `read` subtracts. Peak memory comes from the kernel's own high-water marks, reset at `start` (this also resets the target's `VmHWM` in `/proc`).
-- **One monitor per target.** A second `start` on the same pid returns `EBUSY`, because resetting the peaks for one owner would corrupt another's window. An owner holds at most 64.
-- **A child that already exited can still be read.** A small hook in `do_exit()` saves the final numbers of a monitored process before its memory is freed, so reading after the child was reaped still works (`EXITED` is set). If it was orphaned before it died, its numbers are withheld (`EPERM`).
-- **Lifetime.** Each monitor record names its target by `struct pid`, not by task pointer, so a recycled pid number cannot be confused with it. Records hang off the owner and are freed on `PIDMON_F_STOP` or when the owner exits. Forked children do not inherit them.
-- **A pid is a whole process.** CPU is summed over all its threads and memory is read once from the shared address space. A thread id that is not a process id gives `ESRCH`.
+- **Counters, gauges, peaks.** `start` remembers the counters and `read` subtracts. Gauges are read when asked.
+  Peak memory comes from the kernel's own high-water marks, reset at `start` (this also resets the target's `VmHWM` in `/proc`).
+- **A sampler, only while needed.** A delayed work item judges every live window each 10 ms. It is queued
+  by `pidmon_start` and requeues itself only while some window is live, so an idle system pays nothing.
+- **One monitor per target.** A second `start` on the same pid returns `EBUSY`, because resetting the peaks
+  for one owner would corrupt another's window. An owner holds at most 64.
+- **A child that already exited can still be read.** A small hook in `do_exit()` saves the final numbers
+  and the window's verdict before the memory is freed, so reading after the child was reaped still works.
+  If it was orphaned before it died, its numbers are withheld (`EPERM`).
+- **Lifetime.** Each record names its target by `struct pid`, not by task pointer, so a recycled pid number
+  cannot be confused with it. Records hang off the owner and are freed on `PIDMON_F_STOP` or when the owner
+  exits. Forked and exec'd children do not inherit them; threads of the owner share them.
+- **A pid is a whole process.** CPU is summed over all its threads and memory is read once from the shared
+  address space. A thread id that is not a process id gives `ESRCH`.
 
 ## Kernel changes
 
 | File | Change |
 |---|---|
-| `kernel/pidmon.c` (new) | both syscalls, record bookkeeping, the exit hook |
-| `include/uapi/linux/pidmon.h` (new) | user-visible struct, flags, limit indices |
+| `kernel/pidmon.c` (new) | both syscalls, record bookkeeping, the sampler, the exit hook |
+| `include/uapi/linux/pidmon.h` (new) | user-visible structs, flags, limit indices |
 | `include/linux/pidmon.h` (new) | the exit hook declaration |
 | `kernel/exit.c` | one call to the hook in `do_exit()` |
 | `include/linux/sched/signal.h` | `pidmon_recs` list head in `signal_struct` |
@@ -107,40 +148,45 @@ PROFILE=debug ./scripts/run-all.sh      # same with the debug kernel
 
 ### Tests (`tests/`)
 
-Each test forks its own process tree, so a kill cannot hit the runner. Both profiles pass.
+Each test forks its own process tree, so a kill cannot hit the runner. All 19 pass on both profiles.
 
 | Test | What it checks |
 |---|---|
 | `00_smoke` | the VM boots and runs a static binary |
-| `10_args` | struct size, every argument error, `STOP`, oversized buffers, the 64-monitor cap |
+| `10_args` | struct sizes, every argument error for both calls and the limits struct, `STOP`, oversized buffers, the 64-monitor cap |
+| `15_unlimited` | unlimited limits read as `~0` and never trip; given limits are reported exactly |
 | `20_tree` | self, child, grandchild allowed; parent, sibling, init refused; orphans refused; a subreaper keeps access |
 | `30_usage` | reported CPU, faults, memory, fds and limits agree with `/proc` and `prlimit` |
+| `35_memory` | `mlock`, private mappings and freeing show in the gauges; peaks stay |
 | `40_window` | peaks and counters cover only the time since `start` |
-| `50_enforce` | soft warning once, `NO_ENFORCE`, hard kill, NOFILE, CPU, monitoring yourself |
+| `45_io` | `rchar` and `wchar` cover the window only |
+| `50_enforce` | warning once and kill with no read, `NO_ENFORCE`, given limits vs the target's own, a breach kept after recovery, nothing outside the window, NOFILE, CPU, monitoring yourself |
+| `55_escalation` | warn then kill, several limits at once, hard beats soft |
+| `58_sampler` | breach latency, independent windows with different limits, no enforcement after the owner exits or for an orphan |
 | `60_exit` | a zombie, a reaped child and a killed child keep their numbers; an owner exiting with monitors |
+| `65_scope` | threads share records; fork, exec and descendants do not |
+| `68_restart` | re-arming after `STOP`, a zombie that is not reaped, slot reuse at the cap |
 | `70_threads` | CPU summed over threads, memory counted once, a group whose main thread already exited |
+| `75_owner_exit` | an exiting owner frees all its records, repeated against the cap |
 | `80_ns` | pid namespaces: numbers are resolved in the caller's namespace |
-| `90_stress` | threads and processes racing `start`/`read`/`STOP`/kill against exiting targets |
-| `95_unpriv` | an unprivileged owner can signal a root-owned descendant that `kill(2)` would refuse |
+| `85_rate` | `cpu_permille` for idle, one and two busy threads; `wall_ns` against the clock |
+| `90_stress` | threads and processes racing `start`/`read`/`STOP`/kill against exiting targets and the sampler |
+| `95_unpriv` | an unprivileged owner can signal a root-owned descendant that `kill(2)` would refuse, and set any limit |
 
-### What ran where
+### Where it has been run
 
-| | Environment | busybox |
-|---|---|---|
-| All development and every test run | QEMU VM, `tiny` and `debug` kernels | yes |
-| `demo/pidmon_demo.c`, first runs | the same QEMU VM (`demo/run-demo-qemu.sh`) | yes |
-| `demo/pidmon_demo.c`, native run | lab machine `d153-system`, Ubuntu 24.04, booted into our kernel (built from its own distro config) | no |
-| The test suite on that Ubuntu machine | not run | n/a |
-
-So the KASAN and lockdep checks cover only the QEMU `debug` kernel. On the Ubuntu kernel we confirmed
-only that the kernel log has no `BUG:`, `WARNING:` or `Oops` lines. Some tests assume the busybox VM
-(for example, orphans being adopted by pid 1) and would need changes to run on a systemd machine.
+The current design (limits at `start`, enforcement in the window) has been built and tested in the
+QEMU VM only, on both the `tiny` and `debug` kernels, and the demo has been run there. The KASAN and
+lockdep checks cover only the QEMU `debug` kernel. It has not yet been run on a real machine.
+Some tests assume the busybox VM (for example, orphans being adopted by pid 1) and would need changes
+to run on a systemd machine. Tests `30_usage`, `40_window` and `60_exit` count minor page faults and fail
+when transparent hugepages are set to `always`; use `madvise` or `never`.
 
 ## Demo
 
 `demo/pidmon_demo.c` walks through the features and prints the results: monitoring yourself, the
-ancestry rule, an orphaned grandchild, a full usage report, soft and hard limit enforcement, and
-reading a child that already exited.
+ancestry rule, an orphaned grandchild, a full usage report, soft and hard limit enforcement without any
+read, a report-only window, and reading a child that already exited.
 
 ```bash
 gcc -O1 -Wall -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_demo.c
@@ -152,15 +198,12 @@ gcc -O1 -Wall -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_
   (modules, `/boot`, initramfs, `update-grub`). It needs sudo and does not reboot.
 - The headers come from `make headers_install`. Without them a program can use the raw numbers 473 and 474.
 
-## Doubts
+## Notes
 
-1. Is enforcement at `pidmon_read` time enough, or must a limit be enforced in the background between calls? That would need a timer or a hook in the page-fault path.
-2. Are a time-weighted average of memory and the peak CPU % in a single interval required? Both need sampling. We report totals, the window-average CPU and peak memory.
-3. Is one monitor per target acceptable?
-
-## Somethings
-
-- When the kernel signals a process at its soft `RLIMIT_CPU`, it also raises that soft limit by one second, so by the time `pidmon_read` looks the limit may have moved. The CPU tests therefore check our verdict against the numbers we report, and use the hard limit for the deterministic case.
+- When the kernel signals a process at its own soft `RLIMIT_CPU`, it also raises that soft limit by one second.
+  Limits given to `pidmon_start` are not touched by that, so the CPU tests give their limits in the struct.
+- The kernel's peak-memory marks come from approximate per-CPU counters and can be about 100 KB behind a gauge reading.
+- `RLIMIT_NOFILE` cannot be set to unlimited (it is capped by `fs.nr_open`), so the unlimited tests leave it out.
 - Run QEMU with `</dev/null` under `timeout` (the scripts do): otherwise it stops waiting to read the terminal.
 - The tiny kernel has no ACPI, so the guest ends with `reboot -f` rather than `poweroff`.
 - Read next: `linux/Documentation/process/adding-syscalls.rst`, and `getrusage` in `linux/kernel/sys.c`, which this code follows.
