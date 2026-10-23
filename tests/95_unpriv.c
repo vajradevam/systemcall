@@ -51,11 +51,11 @@ int main(void)
 
 	/* but pidmon works through ancestry */
 	EXPECT_ERR("start", pm_start(c, 0), 0);
+	CHECK(get_byte(from, 3000) == 'T', "SIGTERM did not arrive");
+	waitpid(c, NULL, 0);
 	EXPECT_ERR("read", pm_read(c, 0, &u), 0);
 	CHECK(u.exceeded_soft & (1U << PIDMON_LIM_RSS), "exceeded_soft=%x", u.exceeded_soft);
 	CHECK(u.signal_sent == SIGTERM, "signal_sent=%u", u.signal_sent);
-	CHECK(get_byte(from, 3000) == 'T', "SIGTERM did not arrive");
-	waitpid(c, NULL, 0);
 
 	/* and a child created after the drop */
 	mine = spawn(sleeper, NULL, &fd);
@@ -63,6 +63,26 @@ int main(void)
 	EXPECT_ERR("start own child", pm_start(mine, 0), 0);
 	EXPECT_ERR("read own child", pm_read(mine, 0, &u), 0);
 	kill_reap(mine);
+
+	/* limits in the window need no privilege either, even ones above the process's own hard limit */
+	{
+		struct pidmon_limits lim;
+		struct rlimit rl;
+
+		mine = spawn(sleeper, NULL, &fd);
+		get_byte(fd, 2000);
+		memset(&lim, 0, sizeof(lim));
+		lim_set(&lim, PIDMON_LIM_NOFILE, 1 << 30, 1ULL << 40);
+		lim_set(&lim, PIDMON_LIM_AS, 1, 2);	/* certainly breached: the process has memory */
+		EXPECT_ERR("start with limits", pm_start_lim(mine, 0, &lim), 0);
+		waitpid(mine, NULL, 0);		/* hard breach: killed by the window */
+		EXPECT_ERR("read", pm_read(mine, 0, &u), 0);
+		CHECK(u.exceeded_hard == (1U << PIDMON_LIM_AS), "exceeded_hard=%x", u.exceeded_hard);
+		CHECK(u.signal_sent == SIGKILL, "signal_sent=%u", u.signal_sent);
+		CHECK(u.lim[PIDMON_LIM_NOFILE].hard == 1ULL << 40, "given limit not reported");
+		CHECK(getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_max < (1ULL << 30),
+		      "our own rlimit moved: %llu", (unsigned long long)rl.rlim_max);
+	}
 
 	return test_end();
 }
