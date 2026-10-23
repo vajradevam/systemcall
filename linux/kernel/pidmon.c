@@ -395,6 +395,12 @@ static int pidmon_judge(struct pidmon_usage *u, int *level)
 	return 0;
 }
 
+/* Has the last thread of @t's group begun exiting?  It may still be a zombie. */
+static bool pidmon_group_dead(struct task_struct *t)
+{
+	return !atomic_read(&t->signal->live);
+}
+
 /* Is there already a live record for @tpid, or too many for this owner? */
 static int pidmon_check_room_locked(struct pid *tpid)
 {
@@ -532,6 +538,8 @@ SYSCALL_DEFINE4(pidmon_start, pid_t, pid, unsigned int, flags,
 	/* refuse before touching the target's peak marks */
 	spin_lock(&pidmon_lock);
 	ret = pidmon_check_room_locked(tpid);
+	if (!ret && pidmon_group_dead(t))
+		ret = -ESRCH;
 	spin_unlock(&pidmon_lock);
 	if (ret)
 		goto out_put;
@@ -558,6 +566,13 @@ SYSCALL_DEFINE4(pidmon_start, pid_t, pid, unsigned int, flags,
 
 	spin_lock(&pidmon_lock);
 	ret = pidmon_check_room_locked(tpid);	/* lost a race with another start? */
+	/*
+	 * The exit hook runs after the group's live count reaches zero and looks for a record under
+	 * this lock.  So if the group is still live here, the hook will find the record we link; if it
+	 * is dead, the hook may already have passed and the record would never be frozen or released.
+	 */
+	if (!ret && pidmon_group_dead(t))
+		ret = -ESRCH;
 	if (!ret) {
 		hlist_add_head(&r->owner_node, &current->signal->pidmon_recs);
 		hash_add(pidmon_hash, &r->hash_node, (unsigned long)tpid);
