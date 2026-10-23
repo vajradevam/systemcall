@@ -14,10 +14,12 @@ int main(void)
 	CHECK(sizeof(u) == PIDMON_USAGE_SIZE_VER0, "sizeof=%zu", sizeof(u));
 
 	/* bad arguments */
-	EXPECT_ERR("start flags", pm_start(0, 1), EINVAL);
+	EXPECT_ERR("start flags", pm_start(0, 0x80), EINVAL);
+	EXPECT_ERR("start with a read flag", pm_start(0, PIDMON_F_STOP), EINVAL);
 	EXPECT_ERR("start neg pid", pm_start(-1, 0), EINVAL);
 	EXPECT_ERR("read neg pid", pm_read(-1, 0, &u), EINVAL);
 	EXPECT_ERR("read bad flags", pm_read(0, 0x80, &u), EINVAL);
+	EXPECT_ERR("read with a start flag", pm_read(0, PIDMON_F_NO_ENFORCE, &u), EINVAL);
 	EXPECT_ERR("read usize too small",
 		   (int)(syscall(__NR_pidmon_read, 0, 0, &u, 8) < 0 ? errno : 0), EINVAL);
 	EXPECT_ERR("read usize too big",
@@ -27,6 +29,50 @@ int main(void)
 	EXPECT_ERR("read before start", pm_read(0, 0, &u), ENOENT);
 	EXPECT_ERR("start nonexistent pid", pm_start(999999, 0), ESRCH);
 	EXPECT_ERR("read nonexistent pid", pm_read(999999, 0, &u), ENOENT);
+
+	/* the limits struct is validated before anything is armed */
+	{
+		struct pidmon_limits lim;
+		unsigned char fat[512];
+		long rc;
+
+		memset(&lim, 0, sizeof(lim));
+		lim_set(&lim, PIDMON_LIM_RSS, 10, 5);
+		EXPECT_ERR("soft above hard", pm_start_lim(0, 0, &lim), EINVAL);
+		memset(&lim, 0, sizeof(lim));
+		lim.set = 1U << PIDMON_NLIM;
+		EXPECT_ERR("unknown limit bit", pm_start_lim(0, 0, &lim), EINVAL);
+		memset(&lim, 0, sizeof(lim));
+		lim.lim[PIDMON_LIM_RSS].soft = 10;	/* given but not marked in "set": ignored, even if odd */
+		lim.lim[PIDMON_LIM_RSS].hard = 5;
+		lim_set(&lim, PIDMON_LIM_AS, 5, ~0ULL);
+		rc = syscall(__NR_pidmon_start, 0, 0, &lim, 8);
+		EXPECT_ERR("limits too small", rc < 0 ? errno : 0, EINVAL);
+		rc = syscall(__NR_pidmon_start, 0, 0, &lim, 1 << 20);
+		EXPECT_ERR("limits too big", rc < 0 ? errno : 0, E2BIG);
+		rc = syscall(__NR_pidmon_start, 0, 0, NULL, sizeof(lim));
+		EXPECT_ERR("size without limits", rc < 0 ? errno : 0, EINVAL);
+		rc = syscall(__NR_pidmon_start, 0, 0, (void *)1, sizeof(lim));
+		EXPECT_ERR("bad limits pointer", rc < 0 ? errno : 0, EFAULT);
+		memset(fat, 0, sizeof(fat));
+		memcpy(fat, &lim, sizeof(lim));
+		fat[sizeof(lim) + 5] = 1;
+		rc = syscall(__NR_pidmon_start, 0, 0, fat, sizeof(fat));
+		EXPECT_ERR("unknown trailing field", rc < 0 ? errno : 0, E2BIG);
+		EXPECT_ERR("nothing was armed by the failures", pm_read(0, 0, &u), ENOENT);
+
+		/* a longer struct whose extra tail is zero is fine; the odd, unmarked RSS entry is ignored */
+		fat[sizeof(lim) + 5] = 0;
+		/* report-only: the 5-byte address-space limit would otherwise end this very process */
+		rc = syscall(__NR_pidmon_start, 0, PIDMON_F_NO_ENFORCE, fat, sizeof(fat));
+		EXPECT_ERR("zero tail", rc < 0 ? errno : 0, 0);
+		EXPECT_ERR("read", pm_read(0, 0, &u), 0);
+		CHECK(u.lim[PIDMON_LIM_AS].soft == 5 && u.lim[PIDMON_LIM_AS].hard == ~0ULL,
+		      "AS limit %llu / %llx", (unsigned long long)u.lim[PIDMON_LIM_AS].soft,
+		      (unsigned long long)u.lim[PIDMON_LIM_AS].hard);
+		CHECK(u.lim[PIDMON_LIM_RSS].soft != 10, "an unmarked entry was used");
+		EXPECT_ERR("stop", pm_read(0, PIDMON_F_STOP, &u), 0);
+	}
 
 	/* a bad user pointer fails cleanly and leaves the monitor intact */
 	EXPECT_ERR("start self", pm_start(0, 0), 0);
