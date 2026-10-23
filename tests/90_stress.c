@@ -33,20 +33,31 @@ static void *hammer(void *arg)
 
 		switch (rand_r(&seed) % 5) {
 		case 0:
-		case 1:
 			r = pm_start(p, 0);
 			CHECK(in_set(r, start_ok), "start(%d) -> %d (%s)", p, r, strerror(r));
 			break;
+		case 1: {
+			/* windows with limits that trip at once, so the sampler signals targets that are
+			 * being read, stopped, killed and reaped by the other threads */
+			struct pidmon_limits lim = {};
+			unsigned int k = rand_r(&seed);
+
+			lim_set(&lim, PIDMON_LIM_RSS, 1, k & 1 ? ~0ULL : 2);
+			lim_set(&lim, PIDMON_LIM_NOFILE, k & 2 ? 1 : ~0ULL, ~0ULL);
+			r = pm_start_lim(p, k & 4 ? PIDMON_F_NO_ENFORCE : 0, &lim);
+			CHECK(in_set(r, start_ok), "start lim(%d) -> %d (%s)", p, r, strerror(r));
+			break;
+		}
 		case 2:
-			r = pm_read(p, PIDMON_F_NO_ENFORCE, &u);
+			r = pm_read(p, 0, &u);
 			CHECK(in_set(r, read_ok), "read(%d) -> %d (%s)", p, r, strerror(r));
 			break;
 		case 3:
-			r = pm_read(p, PIDMON_F_STOP | PIDMON_F_NO_ENFORCE, &u);
+			r = pm_read(p, PIDMON_F_STOP, &u);
 			CHECK(in_set(r, read_ok), "read STOP(%d) -> %d (%s)", p, r, strerror(r));
 			break;
 		default:
-			r = pm_read(0, PIDMON_F_NO_ENFORCE, &u);	/* self, usually no record */
+			r = pm_read(0, 0, &u);	/* self, usually no record */
 			CHECK(in_set(r, read_ok), "read self -> %d (%s)", r, strerror(r));
 			break;
 		}
@@ -86,13 +97,13 @@ static void worker(int in, int out)
 		if (rand_r(&seed) % 3 == 0)
 			kill(c, SIGKILL);
 		if (rand_r(&seed) % 2) {
-			r = pm_read(c, PIDMON_F_NO_ENFORCE, &u);
+			r = pm_read(c, 0, &u);
 			CHECK(in_set(r, read_ok), "worker read -> %d", r);
 		}
 		if (rand_r(&seed) % 2)
 			waitpid(c, NULL, 0);
 		if (rand_r(&seed) % 2) {
-			r = pm_read(c, PIDMON_F_STOP | PIDMON_F_NO_ENFORCE, &u);
+			r = pm_read(c, PIDMON_F_STOP, &u);
 			CHECK(in_set(r, read_ok), "worker read STOP -> %d", r);
 		}
 		if (i % 8 == 0)		/* the others pile up and are freed when we exit */
