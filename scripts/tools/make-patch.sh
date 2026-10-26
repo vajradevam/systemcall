@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Produce pidmon.patch: our kernel changes vs. the pinned mainline base (for handing in).
 set -euo pipefail
-. "$(dirname "$0")/env.sh"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"; LINUX="$ROOT/linux"
 BASE="$(cat "$ROOT/BASE_COMMIT")"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 git -C "$T" init -q

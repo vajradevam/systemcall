@@ -4,3 +4,10 @@
 /out/
 pidmon.patch
 /guide/
+
+# explanatory write-up and LaTeX build files
+/docs/pidmon-explained.*
+*.aux
+*.log
+*.toc
+*.out

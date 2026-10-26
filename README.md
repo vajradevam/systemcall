@@ -124,34 +124,65 @@ target has dropped back under it. `state` has `PIDMON_ST_EXITED` once the target
 | `include/linux/syscalls.h`, `kernel/Makefile` | prototypes, build rule |
 | `arch/x86/entry/syscalls/syscall_64.tbl`, `syscall_32.tbl`, `include/uapi/asm-generic/unistd.h`, `scripts/syscall.tbl` | syscall numbers 473 and 474 |
 
-`./scripts/60-mkpatch.sh` writes `pidmon.patch`, which contains exactly these changes against `BASE_COMMIT`.
+`./scripts/tools/make-patch.sh` writes `pidmon.patch`, which contains exactly these changes against `BASE_COMMIT`.
 The test kernel config (`kconfig/tiny.config`) also turns on `TASKSTATS`, `TASK_XACCT` and
 `TASK_IO_ACCOUNTING`, so the I/O fields are filled in; without them they read 0.
 
 ## Build and test
 
-Everything is built and tested in a small QEMU virtual machine, never on the host's own kernel.
-The VM boots our kernel with an initramfs that contains a **static busybox** and the test programs.
-Its `/init` runs every test, checks the kernel log for `BUG:`, `WARNING:`, `Oops` and `KASAN:`
-reports, and prints a verdict that the host script turns into `PASS`, `FAIL` or `TIMEOUT`.
+The scripts are grouped by where they run. Each one prints its options with `--help`.
+
+| Script | Job |
+|---|---|
+| `scripts/busybox/build.sh` | compile the kernel and install its headers into `hdr/` |
+| `scripts/busybox/tests.sh` | compile the tests and run them in the QEMU + busybox VM |
+| `scripts/busybox/demo.sh` | compile the demo and run it in the VM |
+| `scripts/busybox/all.sh` | build, tests, demo, one after the other |
+| `scripts/busybox/vm.sh` | the VM itself: busybox initramfs, QEMU, result. Used by `tests.sh` and `demo.sh` |
+| `scripts/busybox/env.sh` | settings shared by the others (sourced, not run) |
+| `scripts/native/install.sh` | build and install the kernel on this Ubuntu machine: `config`, `build`, `install`, `remove`, `all` |
+| `scripts/native/tests.sh` | run the tests on this machine, which must be running a pidmon kernel |
+| `scripts/native/demo.sh` | run the demo on this machine, which must be running a pidmon kernel |
+| `scripts/tools/kconf.sh` | change options in any kernel `.config` (used by `native/install.sh`, usable anywhere) |
+| `scripts/tools/make-patch.sh` | write `pidmon.patch`, the kernel changes against `BASE_COMMIT` |
+
+```bash
+# In the VM (nothing touches this machine's kernel)
+./scripts/busybox/build.sh             # config (first time), compile, headers into hdr/
+./scripts/busybox/tests.sh             # all tests in the VM
+./scripts/busybox/tests.sh 52_ enforce # only tests whose name contains 52_ or enforce
+./scripts/busybox/demo.sh              # the demo in the VM
+./scripts/busybox/demo.sh docs/examples/guard.c    # any other program that uses the calls
+./scripts/busybox/all.sh               # build, tests, demo
+PROFILE=debug ./scripts/busybox/all.sh # the debug kernel: KASAN, lockdep, atomic-sleep checks
+
+# On a real Ubuntu machine
+./scripts/native/install.sh all        # config, build, install; then reboot
+./scripts/native/tests.sh              # after rebooting into the new kernel
+./scripts/native/demo.sh
+```
+
+`vm.sh` packs a static busybox and the compiled programs into an initramfs, boots the kernel with it
+in QEMU, and runs one command. For the tests it also checks the kernel log for `BUG:`, `WARNING:`,
+`Oops` and `KASAN:` reports. The console log is saved in `out/`.
 
 Two kernel profiles: `tiny` (minimal config, fast) and `debug` (adds KASAN, lockdep, RCU and
 atomic-sleep checks, panic on oops).
 
-You need gcc, make, bc, flex, bison, cpio, gzip, file, qemu-system-x86_64 and a static busybox
-(`./scripts/00-deps.sh` checks). KVM and ccache are optional but much faster.
+For the VM you need gcc, make, bc, flex, bison, cpio, gzip, file, qemu-system-x86_64 and a static busybox.
+KVM and ccache are optional but much faster.
 
-```bash
-./scripts/run-all.sh                    # config (first time), build, initramfs, boot, result
-PROFILE=debug ./scripts/run-all.sh      # same with the debug kernel
-./scripts/run-all.sh --rootfs-only      # only tests changed: skip the kernel rebuild
-./scripts/50-run.sh --gdb               # boot paused, gdb on :1234
-./scripts/60-mkpatch.sh                 # write pidmon.patch
-```
+### Installing the kernel on a real Ubuntu machine
+
+`native/install.sh` starts from the running kernel's config, keeps the modules that are loaded now, and applies
+`tools/kconf.sh`, which sets what Ubuntu's config needs (empty `SYSTEM_TRUSTED_KEYS` and
+`SYSTEM_REVOCATION_KEYS`, no debug info). It installs next to the distro kernels (modules, `/boot`,
+initramfs, GRUB), never reboots, and `remove RELEASE` deletes a kernel again. `kconf.sh` can also apply any
+other change: `scripts/tools/kconf.sh -s linux -O build --enable TASK_XACCT --set-str LOCALVERSION -test`.
 
 ### Tests (`tests/`)
 
-Each test forks its own process tree, so a kill cannot hit the runner. All 19 pass on both profiles.
+Each test forks its own process tree, so a kill cannot hit the runner. All 26 pass on both profiles.
 
 | Test | What it checks |
 |---|---|
@@ -218,14 +249,12 @@ asks and how the kernel answers:
 | 15 | every error the two calls can return |
 
 ```bash
-gcc -O1 -Wall -pthread -isystem <headers_install dir>/include -o pidmon_demo demo/pidmon_demo.c
-./pidmon_demo
+./scripts/busybox/demo.sh          # in the VM
+./scripts/native/demo.sh           # on a machine that runs a pidmon kernel
 ```
 
-- `demo/run-demo-qemu.sh <bzImage> <headers dir>` runs it inside QEMU against any kernel build.
-- `demo/install-kernel.sh` installs a kernel built in `~/pidmon/build-ubuntu` on an Ubuntu machine
-  (modules, `/boot`, initramfs, `update-grub`). It needs sudo and does not reboot.
-- The headers come from `make headers_install`. Without them a program can use the raw numbers 473 and 474.
+- The demo is compiled against the headers in `hdr/` (from `busybox/build.sh` or `native/install.sh build`). Without them a program can
+  use the raw numbers 473 and 474.
 - Scenario 7 needs a system that allows `mlock` of 4 MB; if not, that row says the action was refused.
 
 ## Notes
